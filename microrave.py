@@ -1,0 +1,1084 @@
+"""
+MicroRave Music Player  —  our build
+====================================
+Microwave-shell countdown music-box on Raspberry Pi 5.
+
+Hardware:
+  USB numeric keypad (HID keyboard) — all input, no GPIO buttons
+  HDMI display — fullscreen virtual 7-segment clock face via pygame
+  HDMI audio → TV speakers
+  dcttech USB-HID relay board(s) (16c0:05df) — "cooking" indicator lamp
+
+Behavior: microwave-oven UX (no door)
+  Idle          Shows 12-hour clock
+  Digit press   Enters countdown time (shifts in from right)
+  Start         Begins countdown + music
+  Popcorn       One-touch: 3:00 countdown, starts immediately
+  Potato        One-touch: 3:00 countdown, starts immediately
+  +30s          Adds 30 seconds at any time (may exceed the 5:00 cap while running)
+  Stop          1st press cancels + parks on 0000; 2nd press returns to the clock
+  (countdown)   Ends only when it reaches 0:00 → microwave "ding"
+
+Typed times are clamped to MAX_ENTRY_SECONDS (5:00) when the countdown starts.
+While a countdown runs, all relay channels are ON; they switch OFF on
+finish / stop / idle.
+
+Run from desktop terminal:
+  sudo venv/bin/python microrave.py
+
+Run headless (no desktop session):
+  sudo SDL_VIDEODRIVER=kmsdrm venv/bin/python microrave.py
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import queue
+import random
+import subprocess
+import threading
+import time
+from datetime import datetime
+from enum import Enum, auto
+
+try:
+    import hid as _hid
+    _HID_AVAILABLE = True
+except ImportError:
+    _HID_AVAILABLE = False
+
+import pygame
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+_temp_cache: dict = {"val": "?°C", "ts": 0.0}
+
+def _read_temp() -> str:
+    now = time.monotonic()
+    if now - _temp_cache["ts"] >= 30.0:
+        try:
+            out = subprocess.check_output(["vcgencmd", "measure_temp"], text=True)
+            # "temp=52.3'C" → "52.3°C"
+            _temp_cache["val"] = out.strip().replace("temp=", "").replace("'C", "°C")
+        except Exception:
+            _temp_cache["val"] = "?°C"
+        _temp_cache["ts"] = now
+    return _temp_cache["val"]
+
+class _TempFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.temp = _read_temp()
+        return True
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s [%(temp)s]: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("microrave.log"),
+    ],
+)
+_temp_filter = _TempFilter()
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_temp_filter)
+
+log = logging.getLogger("MicroRave")
+
+# =============================================================================
+# USB KEYPAD MAP  (edit to match your keypad)
+# =============================================================================
+#
+# All input comes from a USB numeric keypad that acts as a USB keyboard. pygame
+# delivers each keypress as a KEYDOWN event; the key constant is looked up here
+# and turned into one of these logical labels:
+#
+#   "0".."9"   digit entry
+#   "START"    begin countdown / (with empty buffer) flash prompt
+#   "STOP"     1st press cancel+park, 2nd press back to clock
+#   "ADD30"    add 30 seconds
+#   "POPCORN"  one-touch 3:00, starts immediately
+#   "POTATO"   one-touch 3:00, starts immediately
+#
+# Numeric keypads emit K_KP* codes; the regular number-row / Enter fallbacks are
+# included so a normal keyboard works for bench testing too.
+
+KEYPAD_MAP = {
+    pygame.K_KP0: "0", pygame.K_KP1: "1", pygame.K_KP2: "2", pygame.K_KP3: "3",
+    pygame.K_KP4: "4", pygame.K_KP5: "5", pygame.K_KP6: "6", pygame.K_KP7: "7",
+    pygame.K_KP8: "8", pygame.K_KP9: "9",
+    pygame.K_0: "0", pygame.K_1: "1", pygame.K_2: "2", pygame.K_3: "3",
+    pygame.K_4: "4", pygame.K_5: "5", pygame.K_6: "6", pygame.K_7: "7",
+    pygame.K_8: "8", pygame.K_9: "9",
+
+    pygame.K_KP_ENTER:    "START",   pygame.K_RETURN:    "START",
+    pygame.K_KP_PERIOD:   "STOP",    pygame.K_BACKSPACE: "STOP",
+    pygame.K_KP_PLUS:     "ADD30",
+    pygame.K_KP_DIVIDE:   "POPCORN",
+    pygame.K_KP_MULTIPLY: "POTATO",
+}
+
+# =============================================================================
+# SETTINGS
+# =============================================================================
+
+# dcttech USB-HID relay board — "cooking" indicator lamp
+RELAY_VID = 0x16c0
+RELAY_PID = 0x05df
+
+MUSIC_ROOT        = "music"          # single shared playlist folder
+SOUNDS_DIR        = "sounds"
+PLAYCOUNTS_FILE   = "playcounts.json"
+BEEP_SOUND        = os.path.join(SOUNDS_DIR, "beep.mp3")
+DING_SOUND        = os.path.join(SOUNDS_DIR, "ding.mp3")
+VOLUME_DEFAULT    = 70    # 0–100
+
+PRESET_SECONDS      = 180   # Popcorn / Potato one-touch time
+MAX_ENTRY_SECONDS   = 300   # typed time is clamped to this when the countdown starts
+ENTRY_IDLE_TIMEOUT  = 60    # seconds on 0000 screen with no input before returning to clock
+
+# =============================================================================
+# DISPLAY COLORS & GEOMETRY
+# =============================================================================
+
+COLOR_BG      = (  0,   0,   0)   # black background
+COLOR_ON      = (  0, 255,   0)   # bright green segments
+COLOR_DIM     = (  0,  13,   0)   # dim green for unlit segments
+SHOW_DIM_SEGS = True               # show unlit segments (real 7-seg look)
+
+# =============================================================================
+# 7-SEGMENT CHARACTER MAP
+# =============================================================================
+
+#   _a_
+#  f   b
+#   _g_
+#  e   c
+#   _d_
+
+CHAR_SEGS: dict[str, set] = {
+    '0': set('abcdef'),
+    '1': set('bc'),
+    '2': set('abdeg'),
+    '3': set('abcdg'),
+    '4': set('bcfg'),
+    '5': set('acdfg'),
+    '6': set('acdefg'),
+    '7': set('abc'),
+    '8': set('abcdefg'),
+    '9': set('abcdfg'),
+    '-': set('g'),
+    ' ': set(),
+}
+
+
+# =============================================================================
+# DISPLAY
+# =============================================================================
+
+class Display:
+    """
+    Fullscreen pygame window rendering a 4-digit 7-segment display.
+    Always green on black.
+
+    Thread safety:
+      show() / show_segs() — safe to call from any thread (sets a pending update)
+      render()             — must be called from the main thread only
+    """
+
+    def __init__(self):
+        info = pygame.display.Info()
+        self._sw = info.current_w
+        self._sh = info.current_h
+
+        self._screen = pygame.display.set_mode(
+            (self._sw, self._sh), pygame.FULLSCREEN | pygame.NOFRAME
+        )
+        pygame.display.set_caption("MicroRave")
+        pygame.mouse.set_visible(False)
+
+        # Hold exclusive keyboard focus so USB-keypad presses don't leak to the
+        # desktop/console behind the fullscreen window. No-op under kmsdrm (SDL
+        # reads evdev directly there).
+        try:
+            pygame.event.set_grab(True)
+        except pygame.error:
+            pass
+
+        # Digit geometry — fill screen minus MARGIN on each edge
+        MARGIN   = 20
+        avail_w  = self._sw - 2 * MARGIN
+        avail_h  = self._sh - 2 * MARGIN
+        ASPECT   = 0.55   # digit width / digit height
+
+        dh_from_w = avail_w / (ASPECT * (4 + 1/3 + 0.4))
+        self._dh  = int(min(dh_from_w, avail_h))
+        self._dw  = int(self._dh * ASPECT)
+        self._T   = max(8, int(self._dh * 0.10))
+        self._G   = max(2, int(self._T  * 0.15))
+
+        col_w = self._dw // 3
+        sp    = max(4, int(self._dw * 0.08))
+
+        total_w = 4 * self._dw + col_w + 5 * sp
+        ox = (self._sw - total_w) // 2
+        oy = (self._sh - self._dh)  // 2
+
+        self._dx = [
+            ox,
+            ox +     self._dw + sp,
+            ox + 2 * self._dw + 2 * sp + col_w + sp,
+            ox + 3 * self._dw + 3 * sp + col_w + sp,
+        ]
+        self._colon_x = ox + 2 * self._dw + 2 * sp
+        self._col_w   = col_w
+        self._oy      = oy
+
+        self._lock     = threading.Lock()
+        self._text     = "    "
+        self._segs:    list[set] = [set(), set(), set(), set()]
+        self._use_segs = False
+        self._colon    = False
+        self._dirty    = True
+
+        log.info("Display ready: %dx%d  digit %dx%d  T=%d",
+                 self._sw, self._sh, self._dw, self._dh, self._T)
+
+    def show(self, text: str, colon: bool = True):
+        """Queue a character display update (thread-safe)."""
+        clean = text.replace(":", "").replace(".", "")[:4].ljust(4)
+        with self._lock:
+            self._text     = clean
+            self._colon    = colon
+            self._use_segs = False
+            self._dirty    = True
+
+    def show_segs(self, segs: list[set], colon: bool = False):
+        """Queue an arbitrary segment display update (thread-safe). segs = list of 4 sets."""
+        with self._lock:
+            self._segs     = list(segs)
+            self._colon    = colon
+            self._use_segs = True
+            self._dirty    = True
+
+    def render(self):
+        """Flush pending update to screen. Call from the main thread only."""
+        with self._lock:
+            if not self._dirty:
+                return
+            text     = self._text
+            segs     = self._segs
+            colon    = self._colon
+            use_segs = self._use_segs
+            self._dirty = False
+
+        self._screen.fill(COLOR_BG)
+        if use_segs:
+            for i, seg_set in enumerate(segs):
+                self._draw_segs_direct(self._dx[i], self._oy, seg_set)
+        else:
+            for i, ch in enumerate(text):
+                self._draw_digit(self._dx[i], self._oy, ch)
+        if colon:
+            self._draw_colon()
+        pygame.display.flip()
+
+    # ------------------------------------------------------------------
+    # Private drawing helpers
+    # ------------------------------------------------------------------
+
+    def _seg_rects(self, x: int, y: int) -> dict:
+        """Build segment-name → pygame rect mapping for a digit at (x, y)."""
+        H, W, T, G = self._dh, self._dw, self._T, self._G
+        h2 = H // 2
+        return {
+            'a': (x + T + G,  y,              W - 2*T - 2*G, T       ),
+            'b': (x + W - T,  y + T + G,      T,             h2-T-2*G),
+            'c': (x + W - T,  y + h2 + G,     T,             h2-T-2*G),
+            'd': (x + T + G,  y + H - T,      W - 2*T - 2*G, T       ),
+            'e': (x,          y + h2 + G,      T,             h2-T-2*G),
+            'f': (x,          y + T + G,       T,             h2-T-2*G),
+            'g': (x + T + G,  y + h2 - T//2,  W - 2*T - 2*G, T       ),
+        }
+
+    def _draw_digit(self, x: int, y: int, ch: str):
+        self._draw_segs_direct(x, y, CHAR_SEGS.get(ch, set()))
+
+    def _draw_segs_direct(self, x: int, y: int, lit: set):
+        for seg, rect in self._seg_rects(x, y).items():
+            if seg in lit:
+                color = COLOR_ON
+            elif SHOW_DIM_SEGS:
+                color = COLOR_DIM
+            else:
+                continue
+            pygame.draw.rect(self._screen, color, rect, border_radius=2)
+
+    def _draw_colon(self):
+        cx = self._colon_x + self._col_w // 2
+        r  = max(4, self._T // 2)
+        pygame.draw.circle(self._screen, COLOR_ON, (cx, self._oy + self._dh // 3),     r)
+        pygame.draw.circle(self._screen, COLOR_ON, (cx, self._oy + 2 * self._dh // 3), r)
+
+
+# =============================================================================
+# PLAYLIST
+# =============================================================================
+
+class Playlist:
+    """Single shared playlist, bag-shuffled.
+
+    All audio files under MUSIC_ROOT (recursively) form one pool. Each track
+    plays once per bag before any repeat; the bag survives across countdowns so
+    short sessions still rotate through the whole folder. At a bag boundary the
+    first track is swapped with the second if it would repeat the just-played
+    one, preventing back-to-back duplicates.
+    """
+
+    _EXTS = ('.mp3', '.wav', '.ogg', '.flac', '.m4a')
+
+    def __init__(self):
+        self._tracks: list[str] = []
+        if os.path.isdir(MUSIC_ROOT):
+            for root, _dirs, files in os.walk(MUSIC_ROOT):
+                for f in files:
+                    if f.lower().endswith(self._EXTS):
+                        self._tracks.append(os.path.join(root, f))
+            self._tracks.sort()
+        if self._tracks:
+            log.info("Playlist: %d track(s) under %s/", len(self._tracks), MUSIC_ROOT)
+        else:
+            log.warning("Playlist empty — no audio files under %s/", MUSIC_ROOT)
+        self._bag: list[str] = []
+        self._last: str | None = None
+
+    def next_track(self) -> str | None:
+        if not self._tracks:
+            return None
+        if not self._bag:
+            new_bag = list(self._tracks)
+            random.shuffle(new_bag)
+            if len(new_bag) > 1 and new_bag[0] == self._last:
+                new_bag[0], new_bag[1] = new_bag[1], new_bag[0]
+            self._bag = new_bag
+            log.info("Playlist bag refilled (%d tracks)", len(new_bag))
+        track = self._bag.pop(0)
+        self._last = track
+        log.info("Next: %s (%d left in bag)", os.path.basename(track), len(self._bag))
+        return track
+
+
+# =============================================================================
+# AUDIO ENGINE
+# =============================================================================
+
+class AudioEngine:
+    _MUSIC_END = pygame.USEREVENT + 1
+
+    def __init__(self):
+        self._ok      = False
+        self._volume  = VOLUME_DEFAULT
+        self._provider = None        # callable() -> next track path, or None to stop
+        self._playing = False
+        self._paused  = False
+        self._lock    = threading.Lock()
+        self._done    = threading.Event()
+        self._counts  = self._load_counts()
+        self._save_counter = 0
+
+        for driver in ("pipewire", "pulseaudio", "alsa", "dummy"):
+            os.environ["SDL_AUDIODRIVER"] = driver
+            try:
+                pygame.mixer.quit()
+                pygame.mixer.pre_init(44100, -16, 2,4096)
+                pygame.mixer.init()
+                log.info("Audio driver: %s", driver)
+                self._ok = True
+                break
+            except Exception as exc:
+                log.warning("Audio driver '%s' failed: %s", driver, exc)
+
+        if not self._ok:
+            log.error("All audio drivers failed — silent mode.")
+            return
+
+        pygame.mixer.set_num_channels(8)
+        pygame.mixer.music.set_endevent(self._MUSIC_END)
+        self._beep_ch  = pygame.mixer.Channel(7)
+        self._ding_ch  = pygame.mixer.Channel(6)
+        self._beep_snd = self._load(BEEP_SOUND, "beep")
+        self._ding_snd = self._load(DING_SOUND, "ding")
+        self._apply_volume()
+
+        threading.Thread(target=self._track_manager, name="TrackManager", daemon=True).start()
+        log.info("Audio ready (volume=%d%%)", self._volume)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def start(self, track_provider):
+        """Start playlist playback.
+        track_provider() is called once now (first track) and again on every
+        track-end (next track). It returns None to stop playback. This lets
+        Playlist bag-shuffle on demand."""
+        if not self._ok or not callable(track_provider):
+            return
+        first = track_provider()
+        if not first:
+            return
+        with self._lock:
+            self._provider = track_provider
+            self._playing  = True
+            self._paused   = False
+        self._play(first)
+
+    def pause(self):
+        if not self._ok:
+            return
+        with self._lock:
+            if not self._playing or self._paused:
+                return
+            self._paused = True
+        pygame.mixer.music.pause()
+
+    def resume(self):
+        if not self._ok:
+            return
+        with self._lock:
+            if not self._playing or not self._paused:
+                return
+            self._paused = False
+        pygame.mixer.music.unpause()
+
+    def stop(self):
+        with self._lock:
+            self._playing = False
+            self._paused  = False
+        if self._ok:
+            pygame.mixer.music.stop()
+
+    def beep(self):
+        if self._ok and self._beep_snd and self._beep_ch:
+            self._beep_ch.stop()
+            self._beep_ch.play(self._beep_snd)
+
+    def ding(self):
+        self.stop()
+        if self._ok and self._ding_snd and self._ding_ch:
+            self._ding_ch.play(self._ding_snd)
+
+    # ------------------------------------------------------------------
+    # Private
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load(path: str, label: str):
+        try:
+            snd = pygame.mixer.Sound(path)
+            log.info("Loaded %s: %s", label, path)
+            return snd
+        except Exception as exc:
+            log.error("Cannot load %s '%s': %s", label, path, exc)
+            return None
+
+    def _load_counts(self) -> dict:
+        try:
+            with open(PLAYCOUNTS_FILE, 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _save_counts(self):
+        try:
+            with open(PLAYCOUNTS_FILE, 'w') as f:
+                json.dump(self._counts, f, indent=2, sort_keys=True)
+        except Exception as exc:
+            log.warning("Could not save play counts: %s", exc)
+
+    def _play(self, path: str):
+        key = os.path.basename(path)
+        self._counts[key] = self._counts.get(key, 0) + 1
+        self._save_counter += 1
+        if self._save_counter >= 5:
+            self._save_counts()
+            self._save_counter = 0
+        try:
+            pygame.mixer.music.load(path)
+            pygame.mixer.music.set_volume(self._volume / 100)
+            pygame.mixer.music.play()
+            log.info("Playing: %s (play #%d)", key, self._counts[key])
+        except Exception as exc:
+            log.error("Cannot play '%s': %s — skipping", path, exc)
+            self._done.set()
+
+    def notify_music_end(self):
+        """Signal that the current track ended. Called from the main thread's event loop."""
+        self._done.set()
+
+    def _track_manager(self):
+        """Advance the playlist when a track ends."""
+        while True:
+            self._done.wait()
+            self._done.clear()
+            with self._lock:
+                if not self._playing or self._paused:
+                    continue
+                nxt = self._provider() if self._provider else None
+                if not nxt:
+                    self._playing = False
+            if nxt:
+                self._play(nxt)
+
+    def shutdown(self):
+        """Flush any unsaved play counts — called by app on exit."""
+        self._save_counts()
+
+    def _apply_volume(self):
+        if self._ok:
+            pygame.mixer.music.set_volume(self._volume / 100)
+
+
+# =============================================================================
+# COUNTDOWN TIMER
+# =============================================================================
+
+class CountdownTimer:
+    """
+    Accurate 1-second countdown.
+    on_tick(remaining) fires every second.
+    on_finish() fires when remaining reaches zero.
+    Both callbacks come from the timer thread — callers should post to a queue.
+    """
+
+    def __init__(self, on_tick, on_finish):
+        self._on_tick   = on_tick
+        self._on_finish = on_finish
+        self._remaining = 0
+        self._lock      = threading.Lock()
+        self._stop      = threading.Event()
+        self._pause     = threading.Event()
+        self._pause.set()
+        self._thread: threading.Thread | None = None
+
+    def start(self, seconds: int):
+        self.stop()
+        with self._lock:
+            self._remaining = max(0, seconds)
+        self._stop.clear()
+        self._pause.set()
+        self._thread = threading.Thread(target=self._run, name="Countdown", daemon=True)
+        self._thread.start()
+
+    def pause(self):
+        self._pause.clear()
+
+    def resume(self):
+        self._pause.set()
+
+    def stop(self):
+        self._stop.set()
+        self._pause.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
+        self._thread = None
+
+    def add(self, n: int):
+        with self._lock:
+            self._remaining = max(0, self._remaining + n)
+        log.info("Timer +%ds → %d remaining", n, self._remaining)
+
+    @property
+    def remaining(self) -> int:
+        with self._lock:
+            return self._remaining
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._pause.wait()
+            if self._stop.is_set():
+                break
+            with self._lock:
+                r = self._remaining
+            self._on_tick(r)
+            if r <= 0:
+                self._on_finish()
+                return
+            self._stop.wait(timeout=1.0)
+            if not self._stop.is_set():
+                with self._lock:
+                    self._remaining = max(0, self._remaining - 1)
+
+
+# =============================================================================
+# TIME ENTRY BUFFER
+# =============================================================================
+
+class TimeEntryBuffer:
+    """
+    Accumulates digit presses into MM:SS time.
+    Digits shift in from the right, exactly like a real microwave keypad.
+    Rejects entries that would exceed 99:59 (the countdown itself is later
+    clamped to MAX_ENTRY_SECONDS when it starts).
+    """
+
+    _MAX = 99 * 60 + 59
+
+    def __init__(self):
+        self._d         = [0, 0, 0, 0]
+        self._from_add30 = False      # True when buffer was last set by +30 (not manual digits)
+
+    def push(self, digit: int):
+        c = self._d[1:] + [digit]
+        if (c[0] * 10 + c[1]) * 60 + (c[2] * 10 + c[3]) <= self._MAX:
+            self._d          = c
+            self._from_add30 = False
+
+    def clear(self):
+        self._d          = [0, 0, 0, 0]
+        self._from_add30 = False
+
+    def to_seconds(self) -> int:
+        return (self._d[0] * 10 + self._d[1]) * 60 + (self._d[2] * 10 + self._d[3])
+
+    def is_zero(self) -> bool:
+        return self.to_seconds() == 0
+
+    def raw_mm(self) -> int:
+        return self._d[0] * 10 + self._d[1]
+
+    def raw_ss(self) -> int:
+        return self._d[2] * 10 + self._d[3]
+
+    def set_from_seconds(self, secs: int):
+        """Overwrite buffer from a seconds value — used by +30 and the presets."""
+        secs = max(0, min(secs, self._MAX))
+        m, s = divmod(secs, 60)
+        self._d          = [m // 10, m % 10, s // 10, s % 10]
+        self._from_add30 = True
+
+    def display_str(self) -> str:
+        """4-char string for the display (raw digits, no normalization)."""
+        return "%d%d%d%d" % tuple(self._d)
+
+
+# =============================================================================
+# APPLICATION STATE
+# =============================================================================
+
+class State(Enum):
+    IDLE          = auto()
+    ENTERING_TIME = auto()
+    COUNTING_DOWN = auto()
+    FINISHED      = auto()
+
+
+# Sentinel posted to the dispatch queue to signal a clean shutdown
+_STOP_SENTINEL = object()
+
+
+# =============================================================================
+# RELAY CONTROLLER  (dcttech USB-HID relay board — "cooking" lamp)
+# =============================================================================
+
+class RelayController:
+    """Drives dcttech USB-HID relay board(s) (VID 16c0:05df) as a "cooking"
+    indicator: all channels ON while a countdown runs, OFF otherwise.
+
+    Opens every matching board that is plugged in. Gracefully disabled if the
+    hidapi package or the hardware is missing.
+
+    Protocol (pavel-a/usb-relay-hid): a 9-byte HID feature report
+    [reportId=0, cmd, channel, 0*6] where cmd is 0xFE all-on / 0xFC all-off /
+    0xFF one-on / 0xFD one-off and channel is 1-based.
+    """
+
+    _ALL_ON  = 0xFE
+    _ALL_OFF = 0xFC
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._devs: list = []
+        if not _HID_AVAILABLE:
+            log.warning("hidapi not installed — USB relay disabled.")
+            return
+        try:
+            for info in _hid.enumerate(RELAY_VID, RELAY_PID):
+                dev = _hid.device()
+                dev.open_path(info["path"])
+                self._devs.append(dev)
+                log.info("USB relay ready: %s serial=%s",
+                         info.get("product_string"), info.get("serial_number"))
+            if not self._devs:
+                log.warning("No USB relay board found (%04x:%04x).", RELAY_VID, RELAY_PID)
+        except Exception as exc:
+            log.warning("USB relay init failed: %s", exc)
+
+    def all_on(self) -> None:
+        self._send(self._ALL_ON)
+
+    def all_off(self) -> None:
+        self._send(self._ALL_OFF)
+
+    def close(self) -> None:
+        with self._lock:
+            for dev in self._devs:
+                try:
+                    dev.send_feature_report(bytes([0, self._ALL_OFF, 0, 0, 0, 0, 0, 0, 0]))
+                    dev.close()
+                except Exception:
+                    pass
+            self._devs = []
+
+    def _send(self, cmd: int) -> None:
+        report = bytes([0, cmd, 0, 0, 0, 0, 0, 0, 0])
+        with self._lock:
+            for dev in self._devs:
+                try:
+                    dev.send_feature_report(report)
+                except Exception as exc:
+                    log.warning("USB relay send error: %s", exc)
+
+
+# =============================================================================
+# APPLICATION
+# =============================================================================
+
+class MicroRaveApp:
+    """
+    All state changes run on a single dispatch thread (via a SimpleQueue).
+    GPIO callbacks and timer callbacks post work items to the queue.
+    Display rendering and the pygame event pump run on the main thread.
+    """
+
+    def __init__(self):
+        self._state       = State.IDLE
+        self._q           = queue.SimpleQueue()
+        self._entry_timer: threading.Timer | None = None
+        self._last_clock: tuple | None = None
+
+        self._dispatch_thread = threading.Thread(target=self._dispatch, name="Dispatch", daemon=True)
+        self._dispatch_thread.start()
+
+        pygame.init()
+        self.display   = Display()
+        self.playlists = Playlist()
+        self.audio     = AudioEngine()
+        self.timer     = CountdownTimer(
+            on_tick   = lambda r: self._post(self._on_tick,   r),
+            on_finish = lambda:   self._post(self._on_finish),
+        )
+        self.buf = TimeEntryBuffer()
+        self._keymap = KEYPAD_MAP
+
+        self.relays = RelayController()
+        self.relays.all_off()          # known-off at boot
+        self._show_clock(force=True)
+        log.info("MicroRave ready.")
+
+    # -------------------------------------------------------------------------
+    # Dispatch queue
+    # -------------------------------------------------------------------------
+
+    def _post(self, fn, *args):
+        self._q.put((fn, args))
+
+    def _dispatch(self):
+        while True:
+            item = self._q.get()
+            if item is _STOP_SENTINEL:
+                break
+            fn, args = item
+            try:
+                fn(*args)
+            except Exception as exc:
+                log.error("Dispatch error in %s: %s", fn.__name__, exc, exc_info=True)
+
+    def _drain(self, timeout: float = 1.0) -> bool:
+        """Block until all currently-queued dispatch items are processed. Used in tests."""
+        done = threading.Event()
+        self._q.put((done.set, ()))
+        return done.wait(timeout=timeout)
+
+    # -------------------------------------------------------------------------
+    # Keypad dispatch
+    # -------------------------------------------------------------------------
+
+    def _on_key(self, label: str):
+        """Route one keypad label to its handler. Runs on the dispatch thread."""
+        if label.isdigit():
+            self._on_digit(int(label))
+        elif label == "START":
+            self._on_start()
+        elif label == "STOP":
+            self._on_stop()
+        elif label == "ADD30":
+            self._on_add_30()
+        elif label in ("POPCORN", "POTATO"):
+            self._on_preset(label)
+
+    # -------------------------------------------------------------------------
+    # Event handlers  (all run on the dispatch thread)
+    # -------------------------------------------------------------------------
+
+    def _on_digit(self, digit: int):
+        log.info("Key: %d", digit)
+        self.audio.beep()
+        if self._state in (State.IDLE, State.ENTERING_TIME):
+            was_idle = self._state == State.IDLE
+            if self.buf._from_add30:
+                # Buffer was set by +30 — add digit as seconds (not digit-shift)
+                self.buf.set_from_seconds(self.buf.to_seconds() + digit)
+            else:
+                self.buf.push(digit)
+            self._state = State.ENTERING_TIME
+            self.display.show(self.buf.display_str())
+            if was_idle:
+                self._start_entry_timer()
+
+    def _on_start(self):
+        log.info("Key: START")
+        self.audio.beep()
+        if self._state == State.ENTERING_TIME and not self.buf.is_zero():
+            self._begin_countdown()
+        elif self._state in (State.IDLE, State.ENTERING_TIME) and self.buf.is_zero():
+            # START with no time entered — prompt by flashing 0000
+            self._state = State.ENTERING_TIME
+            self._flash_zero_prompt()
+            self._start_entry_timer()
+
+    def _on_stop(self):
+        log.info("Key: STOP")
+        self.audio.beep()
+        active = self._state in (State.COUNTING_DOWN, State.FINISHED) or \
+                 (self._state == State.ENTERING_TIME and not self.buf.is_zero())
+        if active:
+            # 1st press — cancel everything and park on 0000
+            self.timer.stop()
+            self.audio.stop()
+            self.relays.all_off()
+            self.buf.clear()
+            self._state = State.ENTERING_TIME
+            self.display.show("0000")
+            self._start_entry_timer()
+            log.info("Stopped — press STOP again for the clock.")
+        else:
+            # 2nd press (already parked on 0000) or from IDLE — back to the clock
+            self._cancel_entry_timer()
+            self._go_idle_from_entry()
+
+    def _on_add_30(self):
+        log.info("Key: +30s")
+        self.audio.beep()
+        if self._state in (State.IDLE, State.ENTERING_TIME):
+            self.buf.set_from_seconds(self.buf.to_seconds() + 30)
+            self._state = State.ENTERING_TIME
+            self.display.show(self.buf.display_str())
+            self._begin_countdown()
+        elif self._state == State.COUNTING_DOWN:
+            self.timer.add(30)   # uncapped — deliberate
+
+    def _on_preset(self, label: str):
+        log.info("Key: %s", label)
+        self.audio.beep()
+        self._cancel_entry_timer()
+        self.timer.stop()
+        self.audio.stop()
+        self.buf.set_from_seconds(PRESET_SECONDS)
+        self._state = State.ENTERING_TIME
+        self.display.show(self.buf.display_str())
+        self._begin_countdown()   # starts immediately — no START press needed
+
+    def _on_tick(self, remaining: int):
+        if self._state == State.COUNTING_DOWN:
+            self.display.show(self._fmt_countdown(remaining))
+
+    def _on_finish(self):
+        log.info("Countdown finished!")
+        self._state = State.FINISHED
+        self.buf.clear()
+        self.audio.ding()
+        self.relays.all_off()
+        self.display.show("0000")
+        t = threading.Timer(3.0, lambda: self._post(self._go_idle))
+        t.daemon = True
+        t.start()
+
+    def _go_idle(self):
+        if self._state == State.FINISHED:
+            self._state = State.IDLE
+            self.relays.all_off()
+            self._show_clock(force=True)
+
+    def _flash_zero_prompt(self) -> None:
+        """Flash 0000 three times to prompt the user to enter a time.
+        Fired when START is pressed with an empty buffer. Runs in a worker
+        thread so the dispatch loop stays responsive. Leaves the display on
+        '0000' at the end so the user can immediately start typing."""
+        def _flash():
+            on_s, off_s = 0.3, 0.2
+            for _ in range(3):
+                self.display.show("0000")
+                time.sleep(on_s)
+                self.display.show("    ", colon=False)
+                time.sleep(off_s)
+            self.display.show("0000")
+        threading.Thread(target=_flash, name="ZeroPromptFlash", daemon=True).start()
+
+    # -------------------------------------------------------------------------
+    # Helpers
+    # -------------------------------------------------------------------------
+
+    def _fmt_countdown(self, remaining: int) -> str:
+        """Format remaining seconds as MM:SS digits for the 4-char display.
+        Minutes clamp at 99 so the format never widens past 4 chars (which
+        would make the display refresh only every 10 ticks)."""
+        m, s = divmod(remaining, 60)
+        return "%02d%02d" % (min(m, 99), s)
+
+    def _begin_countdown(self):
+        self._cancel_entry_timer()
+        secs = min(self.buf.to_seconds(), MAX_ENTRY_SECONDS)
+        if secs == 0:
+            return
+        if self.buf.to_seconds() > MAX_ENTRY_SECONDS:
+            log.info("Entered time clamped to %ds (5:00 cap).", MAX_ENTRY_SECONDS)
+        log.info("Countdown: %ds", secs)
+        self._state = State.COUNTING_DOWN
+        self.audio.start(self.playlists.next_track)
+        self.timer.start(secs)
+        self.relays.all_on()          # cooking indicator
+
+    def _show_clock(self, force: bool = False):
+        now = datetime.now()
+        h   = now.hour % 12 or 12
+        m   = now.minute
+        if not force and (h, m) == self._last_clock:
+            return
+        self._last_clock = (h, m)
+        self.display.show("%2d%02d" % (h, m))
+
+    def _start_entry_timer(self):
+        self._cancel_entry_timer()
+        if ENTRY_IDLE_TIMEOUT > 0:
+            t = threading.Timer(ENTRY_IDLE_TIMEOUT, lambda: self._post(self._go_idle_from_entry))
+            t.daemon = True
+            t.start()
+            self._entry_timer = t
+
+    def _cancel_entry_timer(self):
+        if self._entry_timer:
+            self._entry_timer.cancel()
+            self._entry_timer = None
+
+    def _go_idle_from_entry(self):
+        if self._state != State.ENTERING_TIME:
+            return
+        self.buf.clear()
+        self._state = State.IDLE
+        self._show_clock(force=True)
+        log.info("Returned to clock.")
+
+    # -------------------------------------------------------------------------
+    # Main loop  (runs on main thread — owns pygame event pump and rendering)
+    # -------------------------------------------------------------------------
+
+    def _start_scheduling_watchdog(self):
+        """Background thread that sleeps 20ms in a tight loop and logs any
+        scheduling gap > 60ms. Catches OS/kernel stalls that would also
+        starve the SDL audio callback — the most likely cause of brief clipping."""
+        def _watchdog():
+            target = 0.02
+            stall = 0.06
+            last = time.monotonic()
+            while True:
+                time.sleep(target)
+                now = time.monotonic()
+                gap = now - last
+                if gap > stall:
+                    log.warning("Scheduling watchdog stall: %.0fms (target %.0fms) — possible audio-clip cause",
+                                gap * 1000, target * 1000)
+                last = now
+        threading.Thread(target=_watchdog, name="SchedWatchdog", daemon=True).start()
+
+    def run(self):
+        log.info("Running — Ctrl+C or Esc to quit.")
+        self._start_scheduling_watchdog()
+        last_iter = time.monotonic()
+        try:
+            while True:
+                now = time.monotonic()
+                gap = now - last_iter
+                # Main loop targets 50ms (20fps). >150ms means we hung — possible audio cause.
+                if gap > 0.15:
+                    log.warning("Main loop stall: %.0fms gap (target 50ms)", gap * 1000)
+                last_iter = now
+                for ev in pygame.event.get():
+                    if ev.type == pygame.QUIT:
+                        return
+                    if ev.type == AudioEngine._MUSIC_END:
+                        self.audio.notify_music_end()
+                    elif ev.type == pygame.KEYDOWN:
+                        if ev.key == pygame.K_ESCAPE:
+                            return
+                        label = self._keymap.get(ev.key)
+                        if label:
+                            self._post(self._on_key, label)
+
+                if self._state == State.IDLE:
+                    self._show_clock()
+
+                self.display.render()
+                time.sleep(0.05)   # 20 fps — smooth enough for animation
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._shutdown()
+
+    def _shutdown(self):
+        log.info("Shutting down…")
+        self._cancel_entry_timer()
+        self.timer.stop()
+        self.audio.stop()
+        self.audio.shutdown()        # flush unsaved play counts
+        time.sleep(0.1)
+        self._q.put(_STOP_SENTINEL)  # drain dispatch thread cleanly
+        self.relays.close()          # all relays off, then release the HID handles
+        pygame.quit()
+        log.info("Goodbye.")
+
+
+# =============================================================================
+# STARTUP VALIDATION
+# =============================================================================
+
+def check_env() -> bool:
+    ok = True
+    for path, label in [(BEEP_SOUND, "beep"), (DING_SOUND, "ding")]:
+        if not os.path.isfile(path):
+            log.error("Missing %s sound: %s", label, path)
+            ok = False
+    if not os.path.isdir(MUSIC_ROOT):
+        log.error("Shared playlist folder not found: %s/", MUSIC_ROOT)
+        ok = False
+    return ok
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
+if __name__ == "__main__":
+    if not check_env():
+        log.critical("Environment check failed — fix errors above and restart.")
+        raise SystemExit(1)
+    try:
+        app = MicroRaveApp()
+        app.run()
+    except Exception as exc:
+        log.critical("Fatal: %s", exc, exc_info=True)
+        raise SystemExit(1)
