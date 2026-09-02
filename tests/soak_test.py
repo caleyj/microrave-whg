@@ -43,6 +43,8 @@ _pygame.display.set_mode.return_value = MagicMock()
 _pygame.event.get.return_value = []
 _pygame.mixer.Channel.return_value = MagicMock()
 _pygame.mixer.Sound.return_value = MagicMock()
+_f = MagicMock(); _f.size.return_value = (1200, 400); _f.get_height.return_value = 400
+_pygame.font.Font.return_value = _f; _pygame.font.init = lambda: None
 sys.modules['pygame'] = _pygame
 
 # Kill any previously frozen soak_test instance, excluding this process.

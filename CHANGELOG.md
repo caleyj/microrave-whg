@@ -10,6 +10,13 @@ Re-target `microrave.py` from the 22-switch event panel to a simpler, literal
 microwave: a USB keypad, no door, one-touch presets, and a USB-HID cooking lamp.
 
 ### Added
+- **New display look.** The readout uses the DSEG7 Classic 7-segment font
+  (`fonts/DSEG7Classic-Bold.ttf`, SIL OFL 1.1) rendered green-on-black with a
+  faint `88:88` ghost behind the value and a soft bloom around the lit digits,
+  replacing the hand-drawn segment polygons. Colour and glow are set by the
+  `COLOR_*` / `GLOW_*` / `SHOW_DIM_SEGS` constants near the top of `microrave.py`
+  (a commented amber palette is included); it falls back to the default font if
+  the DSEG file is missing.
 - **USB numeric keypad input.** All input now comes from a USB HID keypad; keypresses
   are read from the pygame event loop and mapped through an editable `KEYPAD_MAP`
   (digits `0`–`9`, `Enter`=Start, `.`=Stop, `+`=+30s, `/`=Popcorn, `*`=Potato).

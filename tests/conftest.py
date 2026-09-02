@@ -30,6 +30,15 @@ _pygame.event.get.return_value        = []
 _pygame.mixer.Channel.return_value    = MagicMock()
 _pygame.mixer.Sound.return_value      = MagicMock()
 
+# Font mock: .size() must return a real (w, h) tuple and .get_height() an int
+# so Display._fit_font can do arithmetic on them.
+_font = MagicMock()
+_font.size.return_value       = (1200, 400)
+_font.get_height.return_value = 400
+_font.render.return_value     = MagicMock()
+_pygame.font.Font.return_value = _font
+_pygame.font.init             = lambda: None
+
 # Install before any test file is imported
 sys.modules['pygame'] = _pygame
 
