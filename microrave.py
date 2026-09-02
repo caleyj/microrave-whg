@@ -144,10 +144,20 @@ ENTRY_IDLE_TIMEOUT  = 60    # seconds on 0000 screen with no input before return
 # DISPLAY COLORS & GEOMETRY
 # =============================================================================
 
-COLOR_BG      = (  0,   0,   0)   # black background
-COLOR_ON      = (  0, 255,   0)   # bright green segments
-COLOR_DIM     = (  0,  13,   0)   # dim green for unlit segments
-SHOW_DIM_SEGS = True               # show unlit segments (real 7-seg look)
+COLOR_BG       = (  0,   0,   0)   # black background
+COLOR_ON       = ( 68, 255, 102)   # lit segment — soft green (not harsh pure green)
+COLOR_GLOW     = ( 14, 110,  40)   # halo colour bloomed around lit segments (kept dim)
+COLOR_DIM      = (  0,  16,   5)   # unlit "ghost" segment (~4% brightness)
+
+SHOW_DIM_SEGS  = True   # show unlit segments faintly (real 7-seg look); False = lit only
+GLOW_ENABLED   = True   # soft bloom around lit segments and the colon
+GLOW_STACK     = 2      # additive passes of the blurred halo (0 disables, higher = brighter)
+GLOW_SPREAD    = 3      # blur radius: halo scaled to 1/N and back (higher N = softer/wider)
+
+# Digit proportions (fractions of digit height unless noted)
+DIGIT_ASPECT   = 0.54   # digit width / digit height
+SEG_THICKNESS  = 0.12   # segment bar thickness
+SEG_GAP        = 0.022  # gap between neighbouring segments
 
 # =============================================================================
 # 7-SEGMENT CHARACTER MAP
@@ -182,7 +192,11 @@ CHAR_SEGS: dict[str, set] = {
 class Display:
     """
     Fullscreen pygame window rendering a 4-digit 7-segment display.
-    Always green on black.
+    Green on black, with chamfered (hexagonal) segments and a soft bloom.
+
+    Each distinct character is rendered once into a cached surface (segments +
+    pre-blurred halo) and then blitted — cheap enough for the Pi even though the
+    blur uses a downscale/upscale pass.
 
     Thread safety:
       show() / show_segs() — safe to call from any thread (sets a pending update)
@@ -212,13 +226,15 @@ class Display:
         MARGIN   = 20
         avail_w  = self._sw - 2 * MARGIN
         avail_h  = self._sh - 2 * MARGIN
-        ASPECT   = 0.55   # digit width / digit height
+        ASPECT   = DIGIT_ASPECT   # digit width / digit height
 
         dh_from_w = avail_w / (ASPECT * (4 + 1/3 + 0.4))
-        self._dh  = int(min(dh_from_w, avail_h))
+        # leave headroom on the height for the glow halo to bleed past the digit
+        self._dh  = int(min(dh_from_w, avail_h * 0.92))
         self._dw  = int(self._dh * ASPECT)
-        self._T   = max(8, int(self._dh * 0.10))
-        self._G   = max(2, int(self._T  * 0.15))
+        self._T   = max(8, int(self._dh * SEG_THICKNESS))
+        self._G   = max(1, int(self._dh * SEG_GAP))
+        self._glow_pad = int(self._T * 0.7) if GLOW_ENABLED else 2
 
         col_w = self._dw // 3
         sp    = max(4, int(self._dw * 0.08))
@@ -243,6 +259,10 @@ class Display:
         self._use_segs = False
         self._colon    = False
         self._dirty    = True
+
+        # Per-character rendered surfaces (segments + halo), built on first use.
+        self._cache: dict[str, "pygame.Surface"] = {}
+        self._colon_halo = self._build_dot_halo() if GLOW_ENABLED else None
 
         log.info("Display ready: %dx%d  digit %dx%d  T=%d",
                  self._sw, self._sh, self._dw, self._dh, self._T)
@@ -276,12 +296,13 @@ class Display:
             self._dirty = False
 
         self._screen.fill(COLOR_BG)
+        pad = self._glow_pad
         if use_segs:
             for i, seg_set in enumerate(segs):
-                self._draw_segs_direct(self._dx[i], self._oy, seg_set)
+                self._blit_segs(self._dx[i], self._oy, seg_set)
         else:
             for i, ch in enumerate(text):
-                self._draw_digit(self._dx[i], self._oy, ch)
+                self._screen.blit(self._digit_surface(ch), (self._dx[i] - pad, self._oy - pad))
         if colon:
             self._draw_colon()
         pygame.display.flip()
@@ -290,38 +311,96 @@ class Display:
     # Private drawing helpers
     # ------------------------------------------------------------------
 
-    def _seg_rects(self, x: int, y: int) -> dict:
-        """Build segment-name → pygame rect mapping for a digit at (x, y)."""
+    def _seg_polys(self, x: float, y: float) -> dict:
+        """Segment-name → hexagonal polygon (list of points) for a digit at (x, y).
+
+        Each bar is a hexagon with 45°-chamfered ends, like a real LED segment.
+        Positions match the classic a–g layout used by CHAR_SEGS.
+        """
         H, W, T, G = self._dh, self._dw, self._T, self._G
-        h2 = H // 2
+        h2 = H / 2
+        t2 = T / 2
+        inner_w = W - 2 * T - 2 * G      # horizontal bar length (between the verticals)
+        seg_h   = h2 - T - 2 * G         # vertical bar length (bar → mid, minus gaps)
+
+        def horiz(px, py, w):
+            return [(px, py + t2), (px + t2, py), (px + w - t2, py),
+                    (px + w, py + t2), (px + w - t2, py + T), (px + t2, py + T)]
+
+        def vert(px, py, h):
+            return [(px + t2, py), (px + T, py + t2), (px + T, py + h - t2),
+                    (px + t2, py + h), (px, py + h - t2), (px, py + t2)]
+
         return {
-            'a': (x + T + G,  y,              W - 2*T - 2*G, T       ),
-            'b': (x + W - T,  y + T + G,      T,             h2-T-2*G),
-            'c': (x + W - T,  y + h2 + G,     T,             h2-T-2*G),
-            'd': (x + T + G,  y + H - T,      W - 2*T - 2*G, T       ),
-            'e': (x,          y + h2 + G,      T,             h2-T-2*G),
-            'f': (x,          y + T + G,       T,             h2-T-2*G),
-            'g': (x + T + G,  y + h2 - T//2,  W - 2*T - 2*G, T       ),
+            'a': horiz(x + T + G, y,            inner_w),
+            'd': horiz(x + T + G, y + H - T,    inner_w),
+            'g': horiz(x + T + G, y + h2 - t2,  inner_w),
+            'f': vert (x,         y + T + G,    seg_h),
+            'b': vert (x + W - T, y + T + G,    seg_h),
+            'e': vert (x,         y + h2 + G,   seg_h),
+            'c': vert (x + W - T, y + h2 + G,   seg_h),
         }
 
-    def _draw_digit(self, x: int, y: int, ch: str):
-        self._draw_segs_direct(x, y, CHAR_SEGS.get(ch, set()))
+    def _digit_surface(self, ch: str) -> "pygame.Surface":
+        """Rendered surface for one character: dim ghost segments, a blurred halo
+        around the lit segments, then the crisp lit segments. Cached per char."""
+        cached = self._cache.get(ch)
+        if cached is not None:
+            return cached
 
-    def _draw_segs_direct(self, x: int, y: int, lit: set):
-        for seg, rect in self._seg_rects(x, y).items():
+        pad = self._glow_pad
+        size = (self._dw + 2 * pad, self._dh + 2 * pad)
+        surf = pygame.Surface(size, pygame.SRCALPHA)
+        polys = self._seg_polys(pad, pad)
+        lit = CHAR_SEGS.get(ch, set())
+
+        if GLOW_ENABLED and lit and GLOW_STACK > 0:
+            halo = pygame.Surface(size, pygame.SRCALPHA)
+            for seg in lit:
+                pygame.draw.polygon(halo, COLOR_GLOW, polys[seg])
+            n = max(2, GLOW_SPREAD)
+            small = pygame.transform.smoothscale(halo, (max(1, size[0] // n), max(1, size[1] // n)))
+            blur  = pygame.transform.smoothscale(small, size)
+            for _ in range(GLOW_STACK):
+                surf.blit(blur, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+
+        for seg, poly in polys.items():
             if seg in lit:
-                color = COLOR_ON
+                pygame.draw.polygon(surf, COLOR_ON, poly)
             elif SHOW_DIM_SEGS:
-                color = COLOR_DIM
-            else:
-                continue
-            pygame.draw.rect(self._screen, color, rect, border_radius=2)
+                pygame.draw.polygon(surf, COLOR_DIM, poly)
+
+        self._cache[ch] = surf
+        return surf
+
+    def _blit_segs(self, x: int, y: int, lit: set):
+        """Draw an arbitrary set of lit segments straight to the screen (no cache,
+        no halo). Only used by the show_segs() path."""
+        for seg, poly in self._seg_polys(x, y).items():
+            if seg in lit:
+                pygame.draw.polygon(self._screen, COLOR_ON, poly)
+            elif SHOW_DIM_SEGS:
+                pygame.draw.polygon(self._screen, COLOR_DIM, poly)
+
+    def _build_dot_halo(self) -> "pygame.Surface":
+        r = max(4, self._T // 2)
+        span = r * 4
+        halo = pygame.Surface((span, span), pygame.SRCALPHA)
+        pygame.draw.circle(halo, COLOR_GLOW, (span // 2, span // 2), int(r * 1.3))
+        n = max(2, GLOW_SPREAD)
+        small = pygame.transform.smoothscale(halo, (max(1, span // n), max(1, span // n)))
+        return pygame.transform.smoothscale(small, (span, span))
 
     def _draw_colon(self):
         cx = self._colon_x + self._col_w // 2
         r  = max(4, self._T // 2)
-        pygame.draw.circle(self._screen, COLOR_ON, (cx, self._oy + self._dh // 3),     r)
-        pygame.draw.circle(self._screen, COLOR_ON, (cx, self._oy + 2 * self._dh // 3), r)
+        for cy in (self._oy + self._dh // 3, self._oy + 2 * self._dh // 3):
+            if self._colon_halo is not None:
+                hw = self._colon_halo.get_width()
+                for _ in range(GLOW_STACK):
+                    self._screen.blit(self._colon_halo, (cx - hw // 2, cy - hw // 2),
+                                      special_flags=pygame.BLEND_RGBA_ADD)
+            pygame.draw.circle(self._screen, COLOR_ON, (cx, cy), r)
 
 
 # =============================================================================
