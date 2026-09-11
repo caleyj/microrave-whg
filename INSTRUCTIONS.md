@@ -24,20 +24,21 @@ stops the background service, runs interactively, then restarts the service on e
 
 ## Keypad Layout
 
-Input is a **USB numeric keypad** (plugged into any USB port — it acts as a
-keyboard). Default key mapping (edit `KEYPAD_MAP` at the top of `microrave.py`
-to change it):
+Input is a **USB keypad** (plugged into any USB port — it acts as a keyboard).
+Function keys are plain letters, no symbol keys. Default key mapping (edit
+`KEYPAD_MAP` at the top of `microrave.py` to move a function to a different key):
 
-| Key on the keypad | Function |
-|-------------------|----------|
-| `0`–`9`           | Enter countdown time (digits shift in from the right) |
-| `Enter`           | **Start** |
-| `.` / `Del`       | **Stop** (1st press cancels, 2nd press returns to clock) |
-| `+`               | **+30s** |
-| `/`               | **Popcorn** — 3:00, starts immediately |
-| `*`               | **Potato** — 3:00, starts immediately |
+| Key | Function |
+|-----|----------|
+| `0`–`9`     | Enter countdown time (digits shift in from the right) |
+| `Enter`     | **Start** |
+| `Backspace` | **Stop** (1st press cancels, 2nd press returns to clock) |
+| `A`         | **Popcorn** — one-touch preset, loops `presets/popcorn.*` |
+| `B`         | **Potato** — one-touch preset, loops `presets/potato.*` |
+| `C`         | **+30s** |
+| `D`         | **Next track** — skips to the next shuffled track (countdown only) |
 
-15 logical buttons total: ten digits, Start, Stop, +30s, Popcorn, Potato.
+16 logical buttons total: ten digits, Start, Stop, +30s, Popcorn, Potato, Next track.
 
 ---
 
@@ -45,10 +46,13 @@ to change it):
 
 1. **Enter time** — press digits; they shift in from the right like a real microwave
 2. **Start** — press Start (`Enter`)
-3. **One-touch** — press Popcorn or Potato for an instant 3:00 countdown
-4. **Add time** — press +30s at any time (this *can* push a running countdown past 5:00)
-5. **Stop** — 1st press cancels the countdown and shows `0000`; 2nd press goes back to the clock
-6. **Finish** — at 0:00 the machine plays a microwave "ding" and returns to the clock
+3. **One-touch** — press Popcorn (`A`) or Potato (`B`) for an instant 3:00 preset
+4. **Add time** — press +30s (`C`) at any time (this *can* push a running countdown past 5:00)
+5. **Skip track** — press Next track (`D`) while counting down to jump to the next
+   shuffled track; the timer is untouched
+6. **Stop** — 1st press (`Backspace`) cancels the countdown and shows `0000`;
+   2nd press goes back to the clock
+7. **Finish** — at 0:00 the machine plays a microwave "ding" and returns to the clock
 
 **5-minute cap:** whatever time you type, the countdown is clamped to **5:00** when
 it starts. `+30s` presses *while it is running* are not capped.
@@ -62,7 +66,10 @@ to the clock automatically.
 
 ```
 /home/pi/MicroRave/
-  music/                 ← one shared playlist (any folder layout; searched recursively)
+  music/                 ← shared playlist (any folder layout; searched recursively)
+  presets/
+    popcorn.mp3          ← looped for the whole Popcorn countdown
+    potato.mp3            ← looped for the whole Potato countdown
   sounds/
     beep.mp3
     ding.mp3
@@ -72,7 +79,13 @@ to the clock automatically.
 Supported formats: `.mp3  .wav  .ogg  .flac  .m4a`
 
 Every countdown bag-shuffles the `music/` folder: each track plays once before any
-repeat, and the bag carries over between countdowns.
+repeat, and the bag carries over between countdowns. **Next track** (`D`) skips ahead
+in this same shuffle — including out of a Popcorn/Potato loop, if pressed.
+
+Popcorn and Potato each play one dedicated track on a loop instead of the shared
+shuffle. Drop a file named `popcorn` and `potato` (any supported extension) into
+`presets/` — if either is missing, that button falls back to the shared shuffle
+and logs a warning.
 
 ---
 

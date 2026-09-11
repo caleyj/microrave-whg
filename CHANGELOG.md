@@ -4,6 +4,23 @@ All notable changes to the MicroRave project are documented here.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — 2026-09-03
+
+### Changed
+- **Keypad map: letters instead of symbols.** Function keys are now plain
+  letters — `A`=Popcorn, `B`=Potato, `C`=+30s, `D`=Next track — instead of the
+  numpad `/ * +` keys. Start stays `Enter`, Stop stays `Backspace`. Edit
+  `KEYPAD_MAP` at the top of `microrave.py` to move a function to a different key.
+- **Popcorn / Potato play a dedicated track.** Each preset now loops one fixed
+  file — `presets/popcorn.*` / `presets/potato.*` (any of the usual audio
+  extensions) — instead of pulling from the shared shuffle. Falls back to the
+  shared shuffle (with a logged warning) if the file is missing.
+
+### Added
+- **Next track button.** Skips to the next track in the shared shuffle. Only
+  does anything while a countdown is running; never touches the timer. Works
+  even during a Popcorn/Potato loop (jumps out into the shared shuffle).
+
 ## [Unreleased] — 2026-08-28 — "our build"
 
 Re-target `microrave.py` from the 22-switch event panel to a simpler, literal

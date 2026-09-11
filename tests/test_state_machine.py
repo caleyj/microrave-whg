@@ -6,6 +6,7 @@ the dispatch queue via app._post(); app._drain() blocks until the queue is empty
 """
 import time
 import pytest
+import microrave
 from microrave import State, PRESET_SECONDS, MAX_ENTRY_SECONDS
 
 
@@ -77,6 +78,26 @@ class TestKeyRouting:
         assert app._state == State.COUNTING_DOWN
 
 
+class TestKeypadMapping:
+    """Function keys are plain letters — no keypad symbols. See microrave.py
+    KEYPAD_MAP: a=Popcorn, b=Potato, c=+30s, d=Next track."""
+
+    def test_letter_keys_map_to_functions(self):
+        assert microrave.KEYPAD_MAP[microrave.pygame.K_a] == "POPCORN"
+        assert microrave.KEYPAD_MAP[microrave.pygame.K_b] == "POTATO"
+        assert microrave.KEYPAD_MAP[microrave.pygame.K_c] == "ADD30"
+        assert microrave.KEYPAD_MAP[microrave.pygame.K_d] == "NEXTTRACK"
+
+    def test_start_and_stop_keys(self):
+        assert microrave.KEYPAD_MAP[microrave.pygame.K_RETURN] == "START"
+        assert microrave.KEYPAD_MAP[microrave.pygame.K_BACKSPACE] == "STOP"
+
+    def test_no_symbol_keys_mapped(self):
+        for k in (microrave.pygame.K_KP_PLUS, microrave.pygame.K_KP_DIVIDE,
+                  microrave.pygame.K_KP_MULTIPLY, microrave.pygame.K_KP_PERIOD):
+            assert k not in microrave.KEYPAD_MAP
+
+
 # ── 5-minute cap ───────────────────────────────────────────────────────────────
 
 class TestFiveMinuteCap:
@@ -114,6 +135,79 @@ class TestPresets:
         app._post(app._on_key, "POPCORN")
         app._drain()
         assert app._state == State.COUNTING_DOWN
+
+
+class TestPresetTracks:
+    """Popcorn/Potato loop a dedicated file from PRESET_DIR when present, and
+    fall back to the shared shuffle when it's missing."""
+
+    def test_dedicated_track_loops(self, app, monkeypatch, tmp_path):
+        preset_dir = tmp_path / "presets"
+        preset_dir.mkdir()
+        track = preset_dir / "popcorn.mp3"
+        track.write_bytes(b"\x00")
+        monkeypatch.setattr(microrave, "PRESET_DIR", str(preset_dir))
+
+        calls = []
+        monkeypatch.setattr(app.audio, "start", lambda tp: calls.append(tp))
+        app._post(app._on_preset, "POPCORN")
+        app._drain()
+
+        assert app._state == State.COUNTING_DOWN
+        assert len(calls) == 1
+        provider = calls[0]
+        # Always returns the same path -> AudioEngine's track_manager loops it.
+        assert provider() == provider() == str(track)
+
+    def test_missing_track_falls_back_to_shared_playlist(self, app, monkeypatch, tmp_path):
+        monkeypatch.setattr(microrave, "PRESET_DIR", str(tmp_path / "no-such-dir"))
+
+        calls = []
+        monkeypatch.setattr(app.audio, "start", lambda tp: calls.append(tp))
+        app._post(app._on_preset, "POTATO")
+        app._drain()
+
+        assert app._state == State.COUNTING_DOWN
+        assert len(calls) == 1
+        assert calls[0] == app.playlists.next_track
+
+
+# ── Next track ─────────────────────────────────────────────────────────────────
+
+class TestNextTrack:
+    """Next Track only does anything while counting down, and never touches
+    the timer — it just asks AudioEngine to advance the shared shuffle."""
+
+    def test_noop_outside_countdown(self, app, monkeypatch):
+        calls = []
+        monkeypatch.setattr(app.audio, "start", lambda tp: calls.append(tp))
+        app._post(app._on_next_track)
+        app._drain()
+        assert calls == []
+        assert app._state == State.IDLE
+
+    def test_advances_during_countdown_without_touching_timer(self, app, monkeypatch):
+        calls = []
+        monkeypatch.setattr(app.audio, "start", lambda tp: calls.append(tp))
+        start_countdown(app, 0, 3, 0)
+        assert len(calls) == 1   # _begin_countdown's own audio.start
+        remaining_before = app.timer.remaining
+
+        app._post(app._on_next_track)
+        app._drain()
+
+        assert len(calls) == 2
+        assert calls[1] == app.playlists.next_track
+        assert app._state == State.COUNTING_DOWN
+        assert app.timer.remaining == pytest.approx(remaining_before, abs=1)
+
+    def test_via_on_key(self, app, monkeypatch):
+        calls = []
+        monkeypatch.setattr(app.audio, "start", lambda tp: calls.append(tp))
+        start_countdown(app, 0, 3, 0)
+        app._post(app._on_key, "NEXTTRACK")
+        app._drain()
+        assert len(calls) == 2
 
 
 # ── +30s ───────────────────────────────────────────────────────────────────────

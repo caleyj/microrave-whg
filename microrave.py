@@ -4,7 +4,7 @@ MicroRave Music Player  —  our build
 Microwave-shell countdown music-box on Raspberry Pi 5.
 
 Hardware:
-  USB numeric keypad (HID keyboard) — all input, no GPIO buttons
+  USB keypad (HID keyboard) — all input, no GPIO buttons
   HDMI display — fullscreen virtual 7-segment clock face via pygame
   HDMI audio → TV speakers
   dcttech USB-HID relay board(s) (16c0:05df) — "cooking" indicator lamp
@@ -12,9 +12,10 @@ Hardware:
 Behavior: microwave-oven UX (no door)
   Idle          Shows 12-hour clock
   Digit press   Enters countdown time (shifts in from right)
-  Start         Begins countdown + music
-  Popcorn       One-touch: 3:00 countdown, starts immediately
-  Potato        One-touch: 3:00 countdown, starts immediately
+  Start         Begins countdown + music (shared shuffled playlist)
+  Popcorn       One-touch: 3:00 countdown, loops presets/popcorn.*
+  Potato        One-touch: 3:00 countdown, loops presets/potato.*
+  Next track    Skips to the next shuffled track — countdown only, timer untouched
   +30s          Adds 30 seconds at any time (may exceed the 5:00 cap while running)
   Stop          1st press cancels + parks on 0000; 2nd press returns to the clock
   (countdown)   Ends only when it reaches 0:00 → microwave "ding"
@@ -92,33 +93,38 @@ log = logging.getLogger("MicroRave")
 # USB KEYPAD MAP  (edit to match your keypad)
 # =============================================================================
 #
-# All input comes from a USB numeric keypad that acts as a USB keyboard. pygame
+# All input comes from a USB keypad that acts as a USB keyboard. pygame
 # delivers each keypress as a KEYDOWN event; the key constant is looked up here
 # and turned into one of these logical labels:
 #
-#   "0".."9"   digit entry
-#   "START"    begin countdown / (with empty buffer) flash prompt
-#   "STOP"     1st press cancel+park, 2nd press back to clock
-#   "ADD30"    add 30 seconds
-#   "POPCORN"  one-touch 3:00, starts immediately
-#   "POTATO"   one-touch 3:00, starts immediately
+#   "0".."9"    digit entry
+#   "START"     begin countdown / (with empty buffer) flash prompt
+#   "STOP"      1st press cancel+park, 2nd press back to clock
+#   "ADD30"     add 30 seconds
+#   "POPCORN"   one-touch preset — plays presets/popcorn.* on a loop
+#   "POTATO"    one-touch preset — plays presets/potato.* on a loop
+#   "NEXTTRACK" skip to the next track in the shuffle (countdown only)
 #
-# Numeric keypads emit K_KP* codes; the regular number-row / Enter fallbacks are
-# included so a normal keyboard works for bench testing too.
+# Function keys are plain letters (no keypad symbols like +, /, *). Digits
+# 0-9 and the numpad equivalents both work; Return starts, Backspace stops.
+# Edit the pygame.K_x on the left to move a function to a different key.
 
 KEYPAD_MAP = {
-    pygame.K_KP0: "0", pygame.K_KP1: "1", pygame.K_KP2: "2", pygame.K_KP3: "3",
-    pygame.K_KP4: "4", pygame.K_KP5: "5", pygame.K_KP6: "6", pygame.K_KP7: "7",
-    pygame.K_KP8: "8", pygame.K_KP9: "9",
     pygame.K_0: "0", pygame.K_1: "1", pygame.K_2: "2", pygame.K_3: "3",
     pygame.K_4: "4", pygame.K_5: "5", pygame.K_6: "6", pygame.K_7: "7",
     pygame.K_8: "8", pygame.K_9: "9",
+    pygame.K_KP0: "0", pygame.K_KP1: "1", pygame.K_KP2: "2", pygame.K_KP3: "3",
+    pygame.K_KP4: "4", pygame.K_KP5: "5", pygame.K_KP6: "6", pygame.K_KP7: "7",
+    pygame.K_KP8: "8", pygame.K_KP9: "9",
 
-    pygame.K_KP_ENTER:    "START",   pygame.K_RETURN:    "START",
-    pygame.K_KP_PERIOD:   "STOP",    pygame.K_BACKSPACE: "STOP",
-    pygame.K_KP_PLUS:     "ADD30",
-    pygame.K_KP_DIVIDE:   "POPCORN",
-    pygame.K_KP_MULTIPLY: "POTATO",
+    pygame.K_RETURN:    "START",
+    pygame.K_KP_ENTER:  "START",
+    pygame.K_BACKSPACE: "STOP",
+
+    pygame.K_a: "POPCORN",
+    pygame.K_b: "POTATO",
+    pygame.K_c: "ADD30",
+    pygame.K_d: "NEXTTRACK",
 }
 
 # =============================================================================
@@ -139,6 +145,12 @@ VOLUME_DEFAULT    = 70    # 0–100
 PRESET_SECONDS      = 180   # Popcorn / Potato one-touch time
 MAX_ENTRY_SECONDS   = 300   # typed time is clamped to this when the countdown starts
 ENTRY_IDLE_TIMEOUT  = 60    # seconds on 0000 screen with no input before returning to clock
+
+# Popcorn / Potato dedicated tracks. Drop a file named "popcorn" and "potato"
+# (any extension from Playlist._EXTS) into PRESET_DIR — it plays on a loop for
+# the whole preset countdown instead of pulling from the shared playlist.
+# Missing file -> falls back to the shared shuffle (logged as a warning).
+PRESET_DIR = "presets"
 
 # =============================================================================
 # DISPLAY  —  DSEG7 "real 7-segment" font, green on black
@@ -340,6 +352,15 @@ class Playlist:
         self._last = track
         log.info("Next: %s (%d left in bag)", os.path.basename(track), len(self._bag))
         return track
+
+
+def _find_preset_track(name: str) -> str | None:
+    """Look for presets/<name>.<ext> (any Playlist._EXTS extension). None if missing."""
+    for ext in Playlist._EXTS:
+        path = os.path.join(PRESET_DIR, name + ext)
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 # =============================================================================
@@ -790,6 +811,8 @@ class MicroRaveApp:
             self._on_add_30()
         elif label in ("POPCORN", "POTATO"):
             self._on_preset(label)
+        elif label == "NEXTTRACK":
+            self._on_next_track()
 
     # -------------------------------------------------------------------------
     # Event handlers  (all run on the dispatch thread)
@@ -861,7 +884,22 @@ class MicroRaveApp:
         self.buf.set_from_seconds(PRESET_SECONDS)
         self._state = State.ENTERING_TIME
         self.display.show(self.buf.display_str())
-        self._begin_countdown()   # starts immediately — no START press needed
+
+        name = label.lower()   # "popcorn" / "potato"
+        track = _find_preset_track(name)
+        if track:
+            log.info("%s: looping %s", label, os.path.basename(track))
+            self._begin_countdown(track_provider=lambda: track)
+        else:
+            log.warning("No %s track found in %s/ — using the shared playlist.",
+                        name, PRESET_DIR)
+            self._begin_countdown()   # starts immediately — no START press needed
+
+    def _on_next_track(self):
+        log.info("Key: NEXT TRACK")
+        self.audio.beep()
+        if self._state == State.COUNTING_DOWN:
+            self.audio.start(self.playlists.next_track)
 
     def _on_tick(self, remaining: int):
         if self._state == State.COUNTING_DOWN:
@@ -910,7 +948,7 @@ class MicroRaveApp:
         m, s = divmod(remaining, 60)
         return "%02d%02d" % (min(m, 99), s)
 
-    def _begin_countdown(self):
+    def _begin_countdown(self, track_provider=None):
         self._cancel_entry_timer()
         secs = min(self.buf.to_seconds(), MAX_ENTRY_SECONDS)
         if secs == 0:
@@ -919,7 +957,7 @@ class MicroRaveApp:
             log.info("Entered time clamped to %ds (5:00 cap).", MAX_ENTRY_SECONDS)
         log.info("Countdown: %ds", secs)
         self._state = State.COUNTING_DOWN
-        self.audio.start(self.playlists.next_track)
+        self.audio.start(track_provider or self.playlists.next_track)
         self.timer.start(secs)
         self.relays.all_on()          # cooking indicator
 
