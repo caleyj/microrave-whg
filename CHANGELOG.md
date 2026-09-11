@@ -11,15 +11,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   letters — `A`=Popcorn, `B`=Potato, `C`=+30s, `D`=Next track — instead of the
   numpad `/ * +` keys. Start stays `Enter`, Stop stays `Backspace`. Edit
   `KEYPAD_MAP` at the top of `microrave.py` to move a function to a different key.
-- **Popcorn / Potato play a dedicated track.** Each preset now loops one fixed
+- **Popcorn / Potato play a dedicated track once.** Each preset plays one fixed
   file — `presets/popcorn.*` / `presets/potato.*` (any of the usual audio
-  extensions) — instead of pulling from the shared shuffle. Falls back to the
-  shared shuffle (with a logged warning) if the file is missing.
+  extensions) — through a single time, no loop, instead of pulling from the
+  shared shuffle. The cosmetic countdown is seeded from the track's measured
+  length; the session actually ends (ding, then idle) the moment playback
+  finishes naturally, via a new `AudioEngine.start(..., on_complete=)` hook —
+  not when that countdown reaches zero, so the track is never cut short and
+  never runs on past its own end. Falls back to the shared shuffle for a fixed
+  3:00 (logged) if the file is missing.
+- **`presets/` is now version-controlled** (previously gitignored like `music/`)
+  — `popcorn.mp3` / `potato.mp3` ship in the repo.
 
 ### Added
 - **Next track button.** Skips to the next track in the shared shuffle. Only
   does anything while a countdown is running; never touches the timer. Works
-  even during a Popcorn/Potato loop (jumps out into the shared shuffle).
+  even during a Popcorn/Potato session (jumps it into the shared shuffle,
+  which also clears the pending on_complete so the borrowed preset countdown
+  becomes the session's actual end time).
 
 ## [Unreleased] — 2026-08-28 — "our build"
 

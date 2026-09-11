@@ -363,6 +363,24 @@ def _find_preset_track(name: str) -> str | None:
     return None
 
 
+def _single_play_provider(path: str):
+    """Track-provider that returns path once, then None forever after — so
+    AudioEngine's track manager plays it exactly once and stops."""
+    it = iter((path,))
+    return lambda: next(it, None)
+
+
+def _probe_track_seconds(path: str, default: int) -> int:
+    """Measured duration of an audio file, rounded up with a 1s safety margin
+    so the cosmetic countdown never reaches zero before the track actually
+    finishes. Falls back to `default` if the file can't be measured."""
+    try:
+        return int(pygame.mixer.Sound(path).get_length()) + 1
+    except Exception as exc:
+        log.warning("Could not measure %s (%s) — using %ds.", os.path.basename(path), exc, default)
+        return default
+
+
 # =============================================================================
 # AUDIO ENGINE
 # =============================================================================
@@ -374,6 +392,7 @@ class AudioEngine:
         self._ok      = False
         self._volume  = VOLUME_DEFAULT
         self._provider = None        # callable() -> next track path, or None to stop
+        self._on_complete = None     # callable(), fired once when the provider is exhausted
         self._playing = False
         self._paused  = False
         self._lock    = threading.Lock()
@@ -412,20 +431,25 @@ class AudioEngine:
     # Public API
     # ------------------------------------------------------------------
 
-    def start(self, track_provider):
+    def start(self, track_provider, on_complete=None):
         """Start playlist playback.
         track_provider() is called once now (first track) and again on every
         track-end (next track). It returns None to stop playback. This lets
-        Playlist bag-shuffle on demand."""
+        Playlist bag-shuffle on demand, or a fixed single track play once and
+        stop (see _single_play_provider).
+        on_complete(), if given, fires once — from the track-manager thread —
+        when the provider naturally runs out. It does NOT fire on an explicit
+        stop()."""
         if not self._ok or not callable(track_provider):
             return
         first = track_provider()
         if not first:
             return
         with self._lock:
-            self._provider = track_provider
-            self._playing  = True
-            self._paused   = False
+            self._provider     = track_provider
+            self._on_complete  = on_complete
+            self._playing      = True
+            self._paused       = False
         self._play(first)
 
     def pause(self):
@@ -448,8 +472,9 @@ class AudioEngine:
 
     def stop(self):
         with self._lock:
-            self._playing = False
-            self._paused  = False
+            self._playing     = False
+            self._paused      = False
+            self._on_complete = None
         if self._ok:
             pygame.mixer.music.stop()
 
@@ -512,18 +537,24 @@ class AudioEngine:
         self._done.set()
 
     def _track_manager(self):
-        """Advance the playlist when a track ends."""
+        """Advance the playlist when a track ends, or fire on_complete once
+        the provider is naturally exhausted (not on an explicit stop())."""
         while True:
             self._done.wait()
             self._done.clear()
+            cb = None
             with self._lock:
                 if not self._playing or self._paused:
                     continue
                 nxt = self._provider() if self._provider else None
                 if not nxt:
                     self._playing = False
+                    cb = self._on_complete
+                    self._on_complete = None
             if nxt:
                 self._play(nxt)
+            elif cb:
+                cb()
 
     def shutdown(self):
         """Flush any unsaved play counts — called by app on exit."""
@@ -881,19 +912,39 @@ class MicroRaveApp:
         self._cancel_entry_timer()
         self.timer.stop()
         self.audio.stop()
-        self.buf.set_from_seconds(PRESET_SECONDS)
-        self._state = State.ENTERING_TIME
-        self.display.show(self.buf.display_str())
 
         name = label.lower()   # "popcorn" / "potato"
         track = _find_preset_track(name)
         if track:
-            log.info("%s: looping %s", label, os.path.basename(track))
-            self._begin_countdown(track_provider=lambda: track)
+            # Play the dedicated track once; the cosmetic countdown is seeded
+            # from its measured length (+1s margin) and _on_preset_track_done
+            # ends the session the moment playback actually finishes, rather
+            # than waiting for that countdown to reach zero.
+            secs = _probe_track_seconds(track, PRESET_SECONDS)
+            self.buf.set_from_seconds(secs)
+            self._state = State.ENTERING_TIME
+            self.display.show(self.buf.display_str())
+            log.info("%s: playing %s once (~%ds)", label, os.path.basename(track), secs)
+            self._begin_countdown(
+                track_provider=_single_play_provider(track),
+                on_complete=lambda: self._post(self._on_preset_track_done),
+                clamp=False,   # a curated preset track isn't subject to the 5:00 cap
+            )
         else:
             log.warning("No %s track found in %s/ — using the shared playlist.",
                         name, PRESET_DIR)
+            self.buf.set_from_seconds(PRESET_SECONDS)
+            self._state = State.ENTERING_TIME
+            self.display.show(self.buf.display_str())
             self._begin_countdown()   # starts immediately — no START press needed
+
+    def _on_preset_track_done(self):
+        """Popcorn/Potato's dedicated track finished playing naturally — end
+        the session now rather than waiting for the cosmetic countdown."""
+        if self._state == State.COUNTING_DOWN:
+            log.info("Preset track finished — ending session.")
+            self.timer.stop()
+            self._on_finish()
 
     def _on_next_track(self):
         log.info("Key: NEXT TRACK")
@@ -948,16 +999,18 @@ class MicroRaveApp:
         m, s = divmod(remaining, 60)
         return "%02d%02d" % (min(m, 99), s)
 
-    def _begin_countdown(self, track_provider=None):
+    def _begin_countdown(self, track_provider=None, on_complete=None, clamp=True):
         self._cancel_entry_timer()
-        secs = min(self.buf.to_seconds(), MAX_ENTRY_SECONDS)
+        secs = self.buf.to_seconds()
+        if clamp:
+            secs = min(secs, MAX_ENTRY_SECONDS)
+            if self.buf.to_seconds() > MAX_ENTRY_SECONDS:
+                log.info("Entered time clamped to %ds (5:00 cap).", MAX_ENTRY_SECONDS)
         if secs == 0:
             return
-        if self.buf.to_seconds() > MAX_ENTRY_SECONDS:
-            log.info("Entered time clamped to %ds (5:00 cap).", MAX_ENTRY_SECONDS)
         log.info("Countdown: %ds", secs)
         self._state = State.COUNTING_DOWN
-        self.audio.start(track_provider or self.playlists.next_track)
+        self.audio.start(track_provider or self.playlists.next_track, on_complete=on_complete)
         self.timer.start(secs)
         self.relays.all_on()          # cooking indicator
 

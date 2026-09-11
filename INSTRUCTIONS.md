@@ -33,8 +33,8 @@ Function keys are plain letters, no symbol keys. Default key mapping (edit
 | `0`–`9`     | Enter countdown time (digits shift in from the right) |
 | `Enter`     | **Start** |
 | `Backspace` | **Stop** (1st press cancels, 2nd press returns to clock) |
-| `A`         | **Popcorn** — one-touch preset, loops `presets/popcorn.*` |
-| `B`         | **Potato** — one-touch preset, loops `presets/potato.*` |
+| `A`         | **Popcorn** — one-touch preset, plays `presets/popcorn.*` once |
+| `B`         | **Potato** — one-touch preset, plays `presets/potato.*` once |
 | `C`         | **+30s** |
 | `D`         | **Next track** — skips to the next shuffled track (countdown only) |
 
@@ -46,13 +46,15 @@ Function keys are plain letters, no symbol keys. Default key mapping (edit
 
 1. **Enter time** — press digits; they shift in from the right like a real microwave
 2. **Start** — press Start (`Enter`)
-3. **One-touch** — press Popcorn (`A`) or Potato (`B`) for an instant 3:00 preset
+3. **One-touch** — press Popcorn (`A`) or Potato (`B`): its dedicated track plays
+   once, then the machine dings and returns to the clock — no fixed 3:00 wait
 4. **Add time** — press +30s (`C`) at any time (this *can* push a running countdown past 5:00)
 5. **Skip track** — press Next track (`D`) while counting down to jump to the next
    shuffled track; the timer is untouched
 6. **Stop** — 1st press (`Backspace`) cancels the countdown and shows `0000`;
    2nd press goes back to the clock
-7. **Finish** — at 0:00 the machine plays a microwave "ding" and returns to the clock
+7. **Finish** — at 0:00 (or when a Popcorn/Potato track ends) the machine plays
+   a microwave "ding" and returns to the clock
 
 **5-minute cap:** whatever time you type, the countdown is clamped to **5:00** when
 it starts. `+30s` presses *while it is running* are not capped.
@@ -68,8 +70,8 @@ to the clock automatically.
 /home/pi/MicroRave/
   music/                 ← shared playlist (any folder layout; searched recursively)
   presets/
-    popcorn.mp3          ← looped for the whole Popcorn countdown
-    potato.mp3            ← looped for the whole Potato countdown
+    popcorn.mp3          ← plays once for Popcorn, then done
+    potato.mp3           ← plays once for Potato, then done
   sounds/
     beep.mp3
     ding.mp3
@@ -80,11 +82,14 @@ Supported formats: `.mp3  .wav  .ogg  .flac  .m4a`
 
 Every countdown bag-shuffles the `music/` folder: each track plays once before any
 repeat, and the bag carries over between countdowns. **Next track** (`D`) skips ahead
-in this same shuffle — including out of a Popcorn/Potato loop, if pressed.
+in this same shuffle — including out of a Popcorn/Potato session, if pressed (which
+also switches that session over to the shared shuffle).
 
-Popcorn and Potato each play one dedicated track on a loop instead of the shared
-shuffle. Drop a file named `popcorn` and `potato` (any supported extension) into
-`presets/` — if either is missing, that button falls back to the shared shuffle
+Popcorn and Potato each play one dedicated track **once** — no loop — and the
+countdown display is timed to that track's actual length, ending (with the "ding")
+the moment playback finishes rather than waiting out a fixed clock. Drop a file
+named `popcorn` and `potato` (any supported extension) into `presets/` — if either
+is missing, that button falls back to the shared shuffle for a fixed 3:00 instead,
 and logs a warning.
 
 ---

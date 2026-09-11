@@ -5,12 +5,10 @@ venv/
 .lgd-nfy0
 microrave.log
 playcounts.json
+.DS_Store
 
 # Music library (too large, personal content)
 music/
-
-# Popcorn / Potato dedicated tracks (personal content — add your own files)
-presets/
 
 # Local-only backups and stray files
 *.old
