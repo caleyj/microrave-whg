@@ -8,6 +8,85 @@ countdown, and it ends only when it reaches 0:00.
 
 ---
 
+## First-Time Setup (New Pi)
+
+Starting from a blank SD card. This build needs no GPIO wiring — just power,
+HDMI, and USB.
+
+1. **Flash the OS.** Raspberry Pi Imager → **Raspberry Pi OS (64-bit), with
+   desktop** (a desktop session is required — MicroRave runs fullscreen over
+   X11/XWayland). In the imager's settings (gear icon) set username **`pi`**
+   (the service files below hardcode `/home/pi/MicroRave`; use a different
+   name only if you're happy to edit those paths), enable SSH, and set Wi-Fi
+   if needed. Boot it and log in.
+
+2. **Update and install dependencies:**
+   ```bash
+   sudo apt update && sudo apt full-upgrade -y
+   sudo apt install -y git python3-venv python3-pip python3-pygame \
+       libhidapi-hidraw0 x11-xserver-utils
+   ```
+
+3. **Clone the repo** into the exact path the service expects:
+   ```bash
+   git clone https://github.com/caleyj/microrave-whg.git ~/MicroRave
+   cd ~/MicroRave
+   ```
+
+4. **Create the venv** (`--system-site-packages` so it can see the apt-installed
+   pygame — only `hidapi` needs to come from pip):
+   ```bash
+   python3 -m venv --system-site-packages venv
+   venv/bin/pip install hidapi
+   ```
+   If that fails to build, `sudo apt install -y libhidapi-dev python3-dev` first.
+
+5. **Add your music.** `sounds/` (beep + ding) and `presets/` (popcorn + potato)
+   already come with the clone — `music/` doesn't (it's gitignored, personal
+   content):
+   ```bash
+   mkdir -p music
+   # copy your tracks into music/ — any folder layout, searched recursively
+   ```
+
+6. **Plug in the hardware:** HDMI display/TV, HDMI (or other) audio out, the USB
+   keypad, and — optionally — the dcttech USB-HID relay board (`16c0:05df`) for
+   the cooking lamp. Everything works with the relay board absent; it just logs
+   "no board found".
+
+7. **Test it manually**, from the Pi's own desktop (not SSH — it needs the
+   display):
+   ```bash
+   cd ~/MicroRave
+   sudo DISPLAY=:0 XAUTHORITY=/home/pi/.Xauthority venv/bin/python microrave.py
+   ```
+   Confirm the clock shows, digits/Enter/Backspace work, and `A`/`B` play the
+   presets. `Esc` quits. If the relay board is plugged in, `lsusb | grep 16c0`
+   should show it.
+
+8. **Install as a boot service:**
+   ```bash
+   sudo cp microrave.service /etc/systemd/system/
+   sudo cp rave.sh /usr/local/bin/rave
+   sudo chmod +x /usr/local/bin/rave start_microrave.sh
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now microrave
+   sudo systemctl status microrave   # should show "active (running)"
+   ```
+   Reboot once (`sudo reboot`) to confirm it comes up on its own.
+
+9. **Optional polish:**
+   - Boot splash/black screen — see **Boot Display** below.
+   - Screen blanking: Bookworm's desktop may blank/dim the display after
+     inactivity. If you see that happen, disable it via `raspi-config` →
+     **Display Options** → **Screen Blanking**, or the equivalent in your
+     desktop's power settings.
+
+From here on, use `rave` / `rave --stats` and the systemd commands below for
+day-to-day use — see **Running MicroRave** and **Service Control**.
+
+---
+
 ## Running MicroRave
 
 | What | Command |
