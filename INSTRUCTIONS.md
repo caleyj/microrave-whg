@@ -15,10 +15,11 @@ HDMI, and USB.
 
 1. **Flash the OS.** Raspberry Pi Imager → **Raspberry Pi OS (64-bit), with
    desktop** (a desktop session is required — MicroRave runs fullscreen over
-   X11/XWayland). In the imager's settings (gear icon) set username **`pi`**
-   (the service files below hardcode `/home/pi/MicroRave`; use a different
-   name only if you're happy to edit those paths), enable SSH, and set Wi-Fi
-   if needed. Boot it and log in.
+   X11/XWayland). In the imager's settings (gear icon), enable SSH and set
+   Wi-Fi if needed. The username you set here (default `pi`) becomes `$USER`
+   below — `microrave.service`, `start_microrave.sh`, and `rave.sh` all
+   hardcode `/home/pi/MicroRave`, and step 8 fixes that up for whatever
+   username you actually chose. Boot it and log in.
 
 2. **Update and install dependencies:**
    ```bash
@@ -58,13 +59,19 @@ HDMI, and USB.
    display):
    ```bash
    cd ~/MicroRave
-   sudo DISPLAY=:0 XAUTHORITY=/home/pi/.Xauthority venv/bin/python microrave.py
+   sudo DISPLAY=:0 XAUTHORITY=/home/$USER/.Xauthority venv/bin/python microrave.py
    ```
    Confirm the clock shows, digits/Enter/Backspace work, and `A`/`B` play the
    presets. `Esc` quits. If the relay board is plugged in, `lsusb | grep 16c0`
    should show it.
 
-8. **Install as a boot service:**
+8. **Install as a boot service.** If your username isn't `pi`, fix the
+   hardcoded paths in your local copies first:
+   ```bash
+   cd ~/MicroRave
+   sed -i "s|/home/pi|/home/$USER|g" microrave.service start_microrave.sh rave.sh
+   ```
+   Then install as usual:
    ```bash
    sudo cp microrave.service /etc/systemd/system/
    sudo cp rave.sh /usr/local/bin/rave
