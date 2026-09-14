@@ -399,3 +399,36 @@ class TestRapidFire:
             app._post(app._on_stop)
         app._drain()
         assert app._state in (State.ENTERING_TIME, State.IDLE)
+
+
+# ── Idle clock ─────────────────────────────────────────────────────────────────
+
+class TestIdleClock:
+    """24-hour format: always two real digits for the hour, so there's no
+    blank leading digit for the DSEG7 ghost segments to show through."""
+
+    def test_single_digit_hour_is_zero_padded(self, app, monkeypatch):
+        import datetime as real_datetime
+
+        class _FixedDateTime:
+            @staticmethod
+            def now():
+                return real_datetime.datetime(2026, 1, 1, 5, 7)   # 05:07
+
+        monkeypatch.setattr(microrave, "datetime", _FixedDateTime)
+        app._last_clock = None
+        app._show_clock(force=True)
+        assert app.display._text == "0507"
+
+    def test_afternoon_hour_stays_24_hour(self, app, monkeypatch):
+        import datetime as real_datetime
+
+        class _FixedDateTime:
+            @staticmethod
+            def now():
+                return real_datetime.datetime(2026, 1, 1, 23, 45)   # 23:45
+
+        monkeypatch.setattr(microrave, "datetime", _FixedDateTime)
+        app._last_clock = None
+        app._show_clock(force=True)
+        assert app.display._text == "2345"

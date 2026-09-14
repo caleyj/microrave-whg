@@ -10,7 +10,7 @@ Hardware:
   dcttech USB-HID relay board(s) (16c0:05df) — "cooking" indicator lamp
 
 Behavior: microwave-oven UX (no door)
-  Idle          Shows 12-hour clock
+  Idle          Shows 24-hour clock
   Digit press   Enters countdown time (shifts in from right)
   Start         Begins countdown + music (shared shuffled playlist)
   Popcorn       One-touch: plays presets/popcorn.* once, then finishes
@@ -1023,13 +1023,16 @@ class MicroRaveApp:
         self.relays.all_on()          # cooking indicator
 
     def _show_clock(self, force: bool = False):
+        """24-hour clock — always two real digits for the hour (00-23), so
+        there's no blank leading digit for the ghost segments to show through
+        (a 12-hour display left that slot blank for 1-9 o'clock)."""
         now = datetime.now()
-        h   = now.hour % 12 or 12
+        h   = now.hour
         m   = now.minute
         if not force and (h, m) == self._last_clock:
             return
         self._last_clock = (h, m)
-        self.display.show("%2d%02d" % (h, m))
+        self.display.show("%02d%02d" % (h, m))
 
     def _start_entry_timer(self):
         self._cancel_entry_timer()

@@ -146,8 +146,9 @@ Function keys are plain letters, no symbol keys. Default key mapping (edit
 **5-minute cap:** whatever time you type, the countdown is clamped to **5:00** when
 it starts. `+30s` presses *while it is running* are not capped.
 
-Idle shows a 12-hour clock. After ~60 s of no input on the entry screen it returns
-to the clock automatically.
+Idle shows a 24-hour clock (`00:00`-`23:59`) — always two real digits for the
+hour, so there's no blank leading digit for the ghost segments to show through.
+After ~60 s of no input on the entry screen it returns to the clock automatically.
 
 ---
 
