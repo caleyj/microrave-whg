@@ -910,6 +910,9 @@ class MicroRaveApp:
             self._begin_countdown()
         elif self._state == State.COUNTING_DOWN:
             self.timer.add(30)   # uncapped — deliberate
+            # Refresh the display immediately — the timer thread's own tick can
+            # be up to 1s away, which reads as "did that even register?".
+            self.display.show(self._fmt_countdown(self.timer.remaining))
 
     def _on_preset(self, label: str):
         log.info("Key: %s", label)

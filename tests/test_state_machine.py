@@ -291,6 +291,14 @@ class TestAdd30:
         app._drain()
         assert app.timer.remaining >= before + 25   # allow for 1 tick during test
 
+    def test_add30_updates_display_immediately(self, app):
+        # The CountdownTimer's own tick can be up to 1s away — the display
+        # must reflect the new remaining time right away, not wait for it.
+        start_countdown(app, 0, 1, 0)   # 1:00
+        app._post(app._on_add_30)
+        app._drain()
+        assert app.display._text == app._fmt_countdown(app.timer.remaining)
+
 
 # ── Two-stage Stop ─────────────────────────────────────────────────────────────
 
