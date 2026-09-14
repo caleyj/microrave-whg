@@ -122,7 +122,7 @@ Function keys are plain letters, no symbol keys. Default key mapping (edit
 | `A`         | **Popcorn** — one-touch preset, plays `presets/popcorn.*` once |
 | `B`         | **Potato** — one-touch preset, plays `presets/potato.*` once |
 | `C`         | **+30s** |
-| `D`         | **Next track** — skips to the next shuffled track (countdown only) |
+| `D`         | **Next track** — skips to the next shuffled track (shared-shuffle countdowns only; no-op during Popcorn/Potato) |
 
 16 logical buttons total: ten digits, Start, Stop, +30s, Popcorn, Potato, Next track.
 
@@ -135,8 +135,9 @@ Function keys are plain letters, no symbol keys. Default key mapping (edit
 3. **One-touch** — press Popcorn (`A`) or Potato (`B`): its dedicated track plays
    once, then the machine dings and returns to the clock — no fixed 3:00 wait
 4. **Add time** — press +30s (`C`) at any time (this *can* push a running countdown past 5:00)
-5. **Skip track** — press Next track (`D`) while counting down to jump to the next
-   shuffled track; the timer is untouched
+5. **Skip track** — press Next track (`D`) during a normal (non-preset) countdown
+   to jump to the next shuffled track; the timer is untouched. Does nothing during
+   a Popcorn/Potato session — there's only the one dedicated track to skip to
 6. **Stop** — 1st press (`Backspace`) cancels the countdown and shows `0000`;
    2nd press goes back to the clock
 7. **Finish** — at 0:00 (or when a Popcorn/Potato track ends) the machine plays
@@ -168,8 +169,8 @@ Supported formats: `.mp3  .wav  .ogg  .flac  .m4a`
 
 Every countdown bag-shuffles the `music/` folder: each track plays once before any
 repeat, and the bag carries over between countdowns. **Next track** (`D`) skips ahead
-in this same shuffle — including out of a Popcorn/Potato session, if pressed (which
-also switches that session over to the shared shuffle).
+in this same shuffle during a normal countdown; it does nothing during a Popcorn/
+Potato session, since there's no shuffle to skip within.
 
 Popcorn and Potato each play one dedicated track **once** — no loop — and the
 countdown display is timed to that track's actual length, ending (with the "ding")

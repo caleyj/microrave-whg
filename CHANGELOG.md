@@ -25,10 +25,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - **Next track button.** Skips to the next track in the shared shuffle. Only
-  does anything while a countdown is running; never touches the timer. Works
-  even during a Popcorn/Potato session (jumps it into the shared shuffle,
-  which also clears the pending on_complete so the borrowed preset countdown
-  becomes the session's actual end time).
+  does anything during a normal (shared-shuffle) countdown; never touches the
+  timer. It's a no-op during a Popcorn/Potato session — there's no "next" for
+  a single dedicated track — and outside `COUNTING_DOWN` generally.
 
 ## [Unreleased] — 2026-08-28 — "our build"
 

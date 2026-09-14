@@ -13,9 +13,11 @@ Behavior: microwave-oven UX (no door)
   Idle          Shows 12-hour clock
   Digit press   Enters countdown time (shifts in from right)
   Start         Begins countdown + music (shared shuffled playlist)
-  Popcorn       One-touch: 3:00 countdown, loops presets/popcorn.*
-  Potato        One-touch: 3:00 countdown, loops presets/potato.*
-  Next track    Skips to the next shuffled track — countdown only, timer untouched
+  Popcorn       One-touch: plays presets/popcorn.* once, then finishes
+  Potato        One-touch: plays presets/potato.* once, then finishes
+  Next track    Skips to the next shuffled track — shared-shuffle countdowns
+                only; no-op during Popcorn/Potato (nothing to skip to) or
+                outside a countdown. Never touches the timer.
   +30s          Adds 30 seconds at any time (may exceed the 5:00 cap while running)
   Stop          1st press cancels + parks on 0000; 2nd press returns to the clock
   (countdown)   Ends only when it reaches 0:00 → microwave "ding"
@@ -101,9 +103,10 @@ log = logging.getLogger("MicroRave")
 #   "START"     begin countdown / (with empty buffer) flash prompt
 #   "STOP"      1st press cancel+park, 2nd press back to clock
 #   "ADD30"     add 30 seconds
-#   "POPCORN"   one-touch preset — plays presets/popcorn.* on a loop
-#   "POTATO"    one-touch preset — plays presets/potato.* on a loop
-#   "NEXTTRACK" skip to the next track in the shuffle (countdown only)
+#   "POPCORN"   one-touch preset — plays presets/popcorn.* once
+#   "POTATO"    one-touch preset — plays presets/potato.* once
+#   "NEXTTRACK" skip to the next shared-shuffle track (no-op during a
+#               Popcorn/Potato session, or outside a countdown)
 #
 # Function keys are plain letters (no keypad symbols like +, /, *). Digits
 # 0-9 and the numpad equivalents both work; Return starts, Backspace stops.
@@ -782,6 +785,8 @@ class MicroRaveApp:
         self._q           = queue.SimpleQueue()
         self._entry_timer: threading.Timer | None = None
         self._last_clock: tuple | None = None
+        self._preset_session = False   # True while a dedicated Popcorn/Potato
+                                        # track is playing — no "next track" then
 
         self._dispatch_thread = threading.Thread(target=self._dispatch, name="Dispatch", daemon=True)
         self._dispatch_thread.start()
@@ -928,7 +933,8 @@ class MicroRaveApp:
             self._begin_countdown(
                 track_provider=_single_play_provider(track),
                 on_complete=lambda: self._post(self._on_preset_track_done),
-                clamp=False,   # a curated preset track isn't subject to the 5:00 cap
+                clamp=False,          # a curated preset track isn't subject to the 5:00 cap
+                preset_session=True,  # blocks Next Track — there's nothing to skip to
             )
         else:
             log.warning("No %s track found in %s/ — using the shared playlist.",
@@ -949,7 +955,7 @@ class MicroRaveApp:
     def _on_next_track(self):
         log.info("Key: NEXT TRACK")
         self.audio.beep()
-        if self._state == State.COUNTING_DOWN:
+        if self._state == State.COUNTING_DOWN and not self._preset_session:
             self.audio.start(self.playlists.next_track)
 
     def _on_tick(self, remaining: int):
@@ -999,7 +1005,8 @@ class MicroRaveApp:
         m, s = divmod(remaining, 60)
         return "%02d%02d" % (min(m, 99), s)
 
-    def _begin_countdown(self, track_provider=None, on_complete=None, clamp=True):
+    def _begin_countdown(self, track_provider=None, on_complete=None, clamp=True,
+                         preset_session=False):
         self._cancel_entry_timer()
         secs = self.buf.to_seconds()
         if clamp:
@@ -1009,6 +1016,7 @@ class MicroRaveApp:
         if secs == 0:
             return
         log.info("Countdown: %ds", secs)
+        self._preset_session = preset_session
         self._state = State.COUNTING_DOWN
         self.audio.start(track_provider or self.playlists.next_track, on_complete=on_complete)
         self.timer.start(secs)

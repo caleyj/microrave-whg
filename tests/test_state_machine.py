@@ -251,6 +251,28 @@ class TestNextTrack:
         app._drain()
         assert len(calls) == 2
 
+    def test_noop_during_preset_session(self, app, monkeypatch, tmp_path):
+        # There's only one dedicated track in a Popcorn/Potato session — no
+        # "next" to skip to — so Next Track must do nothing there.
+        preset_dir = tmp_path / "presets"
+        preset_dir.mkdir()
+        (preset_dir / "popcorn.mp3").write_bytes(b"\x00")
+        monkeypatch.setattr(microrave, "PRESET_DIR", str(preset_dir))
+
+        calls = []
+        monkeypatch.setattr(app.audio, "start", lambda tp, on_complete=None: calls.append(tp))
+        app._post(app._on_preset, "POPCORN")
+        app._drain()
+        assert len(calls) == 1   # the preset's own start() call
+        remaining_before = app.timer.remaining
+
+        app._post(app._on_next_track)
+        app._drain()
+
+        assert len(calls) == 1   # unchanged — next track was ignored
+        assert app._state == State.COUNTING_DOWN
+        assert app.timer.remaining == pytest.approx(remaining_before, abs=1)
+
 
 # ── +30s ───────────────────────────────────────────────────────────────────────
 
