@@ -432,3 +432,27 @@ class TestIdleClock:
         app._last_clock = None
         app._show_clock(force=True)
         assert app.display._text == "2345"
+
+    def test_colon_blinks_with_seconds(self, app, monkeypatch):
+        import datetime as real_datetime
+
+        def _at(second):
+            class _FixedDateTime:
+                @staticmethod
+                def now():
+                    return real_datetime.datetime(2026, 1, 1, 10, 30, second)
+            return _FixedDateTime
+
+        monkeypatch.setattr(microrave, "datetime", _at(0))
+        app._last_clock = None
+        app._show_clock()
+        assert app.display._colon is True    # even second -> on
+
+        # Same minute, second parity flips: must redraw even without force=True.
+        monkeypatch.setattr(microrave, "datetime", _at(1))
+        app._show_clock()
+        assert app.display._colon is False   # odd second -> off (down to the ghost dots)
+
+        monkeypatch.setattr(microrave, "datetime", _at(2))
+        app._show_clock()
+        assert app.display._colon is True
