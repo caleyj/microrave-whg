@@ -10,7 +10,7 @@ Hardware:
   dcttech USB-HID relay board(s) (16c0:05df) — "cooking" indicator lamp
 
 Behavior: microwave-oven UX (no door)
-  Idle          Shows 24-hour clock, colon blinks once a second
+  Idle          Shows 24-hour clock, colon blinks on the half-second
   Digit press   Enters countdown time (shifts in from right)
   Start         Begins countdown + music (shared shuffled playlist)
   Popcorn       One-touch: plays presets/popcorn.* once, then finishes
@@ -1060,12 +1060,12 @@ class MicroRaveApp:
         """24-hour clock — always two real digits for the hour (00-23), so
         there's no blank leading digit for the ghost segments to show through
         (a 12-hour display left that slot blank for 1-9 o'clock). The colon
-        blinks once a second, like a real clock, marking the seconds — on the
-        even second, off (down to the dim ghost dots) on the odd one."""
+        blinks on the half-second — on for the first half of each second, off
+        (down to the dim ghost dots) for the second half."""
         now = datetime.now()
         h     = now.hour
         m     = now.minute
-        colon = now.second % 2 == 0
+        colon = now.microsecond < 500_000
         state = (h, m, colon)
         if not force and state == self._last_clock:
             return

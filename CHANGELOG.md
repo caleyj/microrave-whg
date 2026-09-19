@@ -24,6 +24,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   it. Each cell now colour-keys its background transparent so neighbouring
   cells' padding never overwrites each other's glow.
 
+### Changed
+- **Idle clock colon blinks twice as fast.** On for the first half of each
+  second, off for the second half, instead of a full second each way.
+
 ## [Unreleased] — 2026-09-03
 
 ### Changed

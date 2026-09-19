@@ -148,7 +148,7 @@ it starts. `+30s` presses *while it is running* are not capped.
 
 Idle shows a 24-hour clock (`00:00`-`23:59`) — always two real digits for the
 hour, so there's no blank leading digit for the ghost segments to show through.
-The colon blinks once a second, marking the seconds like a real clock. After
+The colon blinks on the half-second — on, then off, twice every second. After
 ~60 s of no input on the entry screen it returns to the clock automatically.
 
 ---
