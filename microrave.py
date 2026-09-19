@@ -18,7 +18,9 @@ Behavior: microwave-oven UX (no door)
   Next track    Skips to the next shuffled track — shared-shuffle countdowns
                 only; no-op during Popcorn/Potato (nothing to skip to) or
                 outside a countdown. Never touches the timer.
-  +30s          Adds 30 seconds at any time (may exceed the 5:00 cap while running)
+  +30s          Adds 30 seconds during entry or a normal countdown (may
+                exceed the 5:00 cap while running); no-op during Popcorn/
+                Potato (a curated track's length isn't meant to be adjusted)
   Stop          1st press cancels + parks on 0000; 2nd press returns to the clock
   (countdown)   Ends only when it reaches 0:00 → microwave "ding"
 
@@ -939,7 +941,7 @@ class MicroRaveApp:
             self._state = State.ENTERING_TIME
             self.display.show(self.buf.display_str())
             self._begin_countdown()
-        elif self._state == State.COUNTING_DOWN:
+        elif self._state == State.COUNTING_DOWN and not self._preset_session:
             self.timer.add(30)   # uncapped — deliberate
             # Refresh the display immediately — the timer thread's own tick can
             # be up to 1s away, which reads as "did that even register?".

@@ -121,7 +121,7 @@ Function keys are plain letters, no symbol keys. Default key mapping (edit
 | `Backspace` | **Stop** (1st press cancels, 2nd press returns to clock) |
 | `A`         | **Popcorn** — one-touch preset, plays `presets/popcorn.*` once |
 | `B`         | **Potato** — one-touch preset, plays `presets/potato.*` once |
-| `C`         | **+30s** |
+| `C`         | **+30s** — during entry or a normal countdown; no-op during Popcorn/Potato |
 | `D`         | **Next track** — skips to the next shuffled track (shared-shuffle countdowns only; no-op during Popcorn/Potato) |
 
 16 logical buttons total: ten digits, Start, Stop, +30s, Popcorn, Potato, Next track.
@@ -134,7 +134,9 @@ Function keys are plain letters, no symbol keys. Default key mapping (edit
 2. **Start** — press Start (`Enter`)
 3. **One-touch** — press Popcorn (`A`) or Potato (`B`): its dedicated track plays
    once, then the machine dings and returns to the clock — no fixed 3:00 wait
-4. **Add time** — press +30s (`C`) at any time (this *can* push a running countdown past 5:00)
+4. **Add time** — press +30s (`C`) while entering a time or during a normal countdown
+   (this *can* push a running countdown past 5:00). Does nothing during a
+   Popcorn/Potato session — a curated track's length isn't meant to be adjusted
 5. **Skip track** — press Next track (`D`) during a normal (non-preset) countdown
    to jump to the next shuffled track; the timer is untouched. Does nothing during
    a Popcorn/Potato session — there's only the one dedicated track to skip to

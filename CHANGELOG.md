@@ -27,6 +27,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - **Idle clock colon blinks twice as fast.** On for the first half of each
   second, off for the second half, instead of a full second each way.
+- **+30s is now a no-op during Popcorn/Potato**, same as Next Track already
+  was — a curated preset track's length isn't meant to be adjusted.
 
 ## [Unreleased] — 2026-09-03
 

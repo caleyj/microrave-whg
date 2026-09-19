@@ -299,6 +299,23 @@ class TestAdd30:
         app._drain()
         assert app.display._text == app._fmt_countdown(app.timer.remaining)
 
+    def test_noop_during_preset_session(self, app, monkeypatch, tmp_path):
+        # A curated Popcorn/Potato track's length isn't meant to be adjusted.
+        preset_dir = tmp_path / "presets"
+        preset_dir.mkdir()
+        (preset_dir / "potato.mp3").write_bytes(b"\x00")
+        monkeypatch.setattr(microrave, "PRESET_DIR", str(preset_dir))
+
+        app._post(app._on_preset, "POTATO")
+        app._drain()
+        remaining_before = app.timer.remaining
+
+        app._post(app._on_add_30)
+        app._drain()
+
+        assert app._state == State.COUNTING_DOWN
+        assert app.timer.remaining == pytest.approx(remaining_before, abs=1)
+
 
 # ── Two-stage Stop ─────────────────────────────────────────────────────────────
 
