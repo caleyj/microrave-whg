@@ -4,6 +4,26 @@ All notable changes to the MicroRave project are documented here.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — 2026-09-19
+
+### Fixed
+- **"Main loop stall" warnings during any countdown.** `Display` cached its
+  DSEG7 render by the whole 5-character string ("12:34"). That's fine for
+  the idle clock (only a couple of distinct minutes shown per hour), but
+  during a countdown the string is different every second, so it was a
+  100% cache miss doing a full font render + glow blur on the main thread
+  on every single tick (~40-60ms measured on a much faster machine than the
+  Pi — comfortably over the 150ms stall threshold once you add real Pi
+  hardware and desktop-compositor load). Fixed by pre-rendering every
+  glyph this display can ever show — '0'-'9', a blank digit, colon on/off —
+  once at startup (DSEG7 is fixed-pitch, so cells blit together seamlessly),
+  and having `render()` just blit up to 5 of them. Per-tick cost dropped
+  from ~40-60ms to under a millisecond in the same measurement.
+- Fixed a rendering bug this surfaced: the colon cell is narrower than its
+  own glow padding, so the next digit's opaque blit was overwriting part of
+  it. Each cell now colour-keys its background transparent so neighbouring
+  cells' padding never overwrites each other's glow.
+
 ## [Unreleased] — 2026-09-03
 
 ### Changed

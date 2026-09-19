@@ -186,8 +186,15 @@ class Display:
     DSEG7 Classic font. A faint "88:88" ghost sits behind the value and a soft
     bloom is drawn around the lit digits.
 
-    Each distinct value string is rendered once into a cached surface (ghost +
-    halo + value) and then blitted, so the per-frame cost is one blit.
+    Every glyph this display can ever show — '0'-'9', a blank digit, and the
+    colon on/off — is pre-rendered (ghost + blurred halo + crisp glyph) once
+    at startup into a fixed cell. render() just blits up to 5 of these cells
+    side by side. (An earlier version cached by the whole 5-character string
+    instead of by glyph — harmless for the idle clock, which only shows a
+    couple of distinct minutes at a time, but during any countdown the string
+    changes every second, so it was a 100% cache-miss doing a full font
+    render + blur on the main thread on every single tick — the actual cause
+    of the "main loop stall" warnings.)
 
     Thread safety:
       show()   — safe from any thread (queues a pending update)
@@ -217,19 +224,30 @@ class Display:
         self._font = self._fit_font(int(self._sw * DISPLAY_FILL), int(self._sh * DISPLAY_FILL))
         self._pad  = max(8, self._font.get_height() // 8) if GLOW_ENABLED else 2
 
-        gw, gh = self._font.size(self._GHOST)
-        self._surf_w = gw + 2 * self._pad
-        self._surf_h = gh + 2 * self._pad
-        self._ox = (self._sw - self._surf_w) // 2
-        self._oy = (self._sh - self._surf_h) // 2
+        # DSEG7 is fixed-pitch — every digit is the same width, and so is the
+        # colon (confirmed: sum of per-glyph widths == width of the whole
+        # string, no kerning) — so pre-rendered cells can be blitted side by
+        # side and it's pixel-identical to rendering the whole string.
+        self._digit_w, self._cell_h = self._font.size('0')
+        self._colon_w = self._font.size(':')[0]
+        content_w = 4 * self._digit_w + self._colon_w
+        self._ox = (self._sw - content_w) // 2
+        self._oy = (self._sh - self._cell_h) // 2
 
-        self._ghost = self._font.render(self._GHOST, True, COLOR_DIM) if SHOW_DIM_SEGS else None
+        # Every glyph this display can ever need, pre-rendered once (ghost +
+        # blurred halo + crisp glyph baked into one cell) — see the class
+        # docstring for why this replaced whole-string-per-tick rendering.
+        self._digit_cell = {ch: self._build_glyph(ch, '8', self._digit_w) for ch in '0123456789'}
+        self._digit_cell[' '] = self._build_glyph(' ', '8', self._digit_w)
+        self._colon_cell = {
+            True:  self._build_glyph(':', ':', self._colon_w),
+            False: self._build_glyph(' ', ':', self._colon_w),
+        }
 
         self._lock  = threading.Lock()
         self._text  = "    "
         self._colon = False
         self._dirty = True
-        self._cache: dict[str, "pygame.Surface"] = {}
 
         log.info("Display ready: %dx%d  font=%dpx", self._sw, self._sh, self._font.get_height())
 
@@ -253,6 +271,41 @@ class Display:
             size = max(10, int(size * min(max_w / w, max_h / h)) - 1)
         return pygame.font.Font(path, size)
 
+    def _build_glyph(self, bright_ch: str, ghost_ch: str, cell_w: int) -> "pygame.Surface":
+        """One pre-rendered cell: a dim ghost glyph (e.g. always '8' for a
+        digit slot, so unlit segments show faintly), then — if bright_ch is
+        a real character, not a blank — a blurred halo and the crisp glyph
+        on top. Built once at startup; render() only ever blits these.
+
+        Cells are wider than their glyph (padded so the glow has room to
+        bleed past it) and, with no natural gap between characters in this
+        font, sit edge to edge — so each cell's padding overlaps its
+        neighbour's. COLOR_BG is colour-keyed transparent so that overlap
+        never overwrites the neighbour's own glow bleed with black (the
+        colon cell in particular is narrower than the padding itself)."""
+        pad = self._pad
+        size = (cell_w + 2 * pad, self._cell_h + 2 * pad)
+        surf = pygame.Surface(size)
+        surf.fill(COLOR_BG)
+
+        if SHOW_DIM_SEGS:
+            surf.blit(self._font.render(ghost_ch, True, COLOR_DIM), (pad, pad))
+
+        if bright_ch != ' ':
+            if GLOW_ENABLED and GLOW_STACK > 0:
+                glow = pygame.Surface(size)
+                glow.fill(COLOR_BG)
+                glow.blit(self._font.render(bright_ch, True, COLOR_GLOW), (pad, pad))
+                n = max(2, GLOW_SPREAD)
+                glow = pygame.transform.smoothscale(glow, (max(1, size[0] // n), max(1, size[1] // n)))
+                glow = pygame.transform.smoothscale(glow, size)
+                for _ in range(GLOW_STACK):
+                    surf.blit(glow, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+            surf.blit(self._font.render(bright_ch, True, COLOR_ON), (pad, pad))
+
+        surf.set_colorkey(COLOR_BG)
+        return surf
+
     def show(self, text: str, colon: bool = True):
         """Queue a display update (thread-safe). text is up to 4 chars, MMSS."""
         clean = text.replace(":", "").replace(".", "")[:4].ljust(4)
@@ -266,7 +319,10 @@ class Display:
         pass
 
     def render(self):
-        """Flush pending update to screen. Call from the main thread only."""
+        """Flush pending update to screen. Call from the main thread only.
+        Just blits up to 5 pre-built cells — no font rendering or blurring
+        happens here, so this is cheap regardless of how often the value
+        changes (every tick, during a countdown)."""
         with self._lock:
             if not self._dirty:
                 return
@@ -274,40 +330,15 @@ class Display:
             self._dirty = False
 
         self._screen.fill(COLOR_BG)
-        self._screen.blit(self._value_surface(text, colon), (self._ox, self._oy))
+        pad = self._pad
+        x, y = self._ox, self._oy
+        for i, ch in enumerate(text):
+            if i == 2:
+                self._screen.blit(self._colon_cell[colon], (x - pad, y - pad))
+                x += self._colon_w
+            self._screen.blit(self._digit_cell.get(ch, self._digit_cell[' ']), (x - pad, y - pad))
+            x += self._digit_w
         pygame.display.flip()
-
-    # ------------------------------------------------------------------
-
-    def _value_surface(self, text: str, colon: bool) -> "pygame.Surface":
-        """Opaque black tile: dim 88:88 ghost, then a blurred halo (RGB-added so
-        it never washes the unlit segments), then the crisp lit value."""
-        key = text + (":" if colon else " ")
-        cached = self._cache.get(key)
-        if cached is not None:
-            return cached
-
-        disp = text[:2] + (":" if colon else " ") + text[2:]
-        size = (self._surf_w, self._surf_h)
-        surf = pygame.Surface(size)
-        surf.fill(COLOR_BG)
-        if self._ghost is not None:
-            surf.blit(self._ghost, (self._pad, self._pad))
-
-        if disp.strip():
-            if GLOW_ENABLED and GLOW_STACK > 0:
-                glow = pygame.Surface(size)
-                glow.fill(COLOR_BG)
-                glow.blit(self._font.render(disp, True, COLOR_GLOW), (self._pad, self._pad))
-                n = max(2, GLOW_SPREAD)
-                glow = pygame.transform.smoothscale(glow, (max(1, size[0] // n), max(1, size[1] // n)))
-                glow = pygame.transform.smoothscale(glow, size)
-                for _ in range(GLOW_STACK):
-                    surf.blit(glow, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
-            surf.blit(self._font.render(disp, True, COLOR_ON), (self._pad, self._pad))
-
-        self._cache[key] = surf
-        return surf
 
 
 # =============================================================================
