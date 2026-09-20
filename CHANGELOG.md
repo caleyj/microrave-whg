@@ -4,6 +4,28 @@ All notable changes to the MicroRave project are documented here.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — 2026-09-20
+
+### Fixed
+- **A second source of "main loop stall": bad audio files.** A malformed file
+  in `music/` (confirmed: `mpg123_getformat: ... I am done with this track.`,
+  the exact message reported) made `pygame.mixer.music.load()` do real,
+  slow decode/resync work before failing — a genuine blocking call, and one
+  that repeated every time the shuffle's bag rotated back to that file. The
+  previous fix (caching `Display` glyphs) addressed one cause of these
+  stalls; this is another, independent one.
+  `Playlist` now test-loads every candidate file through the mixer once, at
+  startup — after `AudioEngine` (reordered in `MicroRaveApp.__init__`, since
+  the mixer has to exist first) — and excludes anything that fails, logging
+  the exact path so it's obvious which file to fix or remove. A bad file now
+  costs one slow load at boot instead of a live-countdown stall every time
+  it comes up in rotation.
+  Added a matching safety net in `AudioEngine` for failures that only show
+  up at runtime regardless (a transient read error, a file that goes bad
+  mid-session): a failed `_play()` now retries after a short pause instead
+  of hammering the next track immediately, and gives up after 5 consecutive
+  failures rather than spinning forever.
+
 ## [Unreleased] — 2026-09-19
 
 ### Fixed

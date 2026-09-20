@@ -355,22 +355,46 @@ class Playlist:
     short sessions still rotate through the whole folder. At a bag boundary the
     first track is swapped with the second if it would repeat the just-played
     one, preventing back-to-back duplicates.
+
+    Every candidate is test-loaded through the mixer once here, at startup,
+    and dropped if it fails — better to pay for a slow/bad file once at boot
+    (logged, so it's obvious which file to fix) than to hit that same cost
+    live mid-countdown, which for a badly-encoded file can be a genuine
+    multi-hundred-ms blocking call and a real source of main-loop stalls.
+    Skipped if the mixer never came up (no audio driver found) — see
+    AudioEngine, which must exist before this class does.
     """
 
     _EXTS = ('.mp3', '.wav', '.ogg', '.flac', '.m4a')
 
     def __init__(self):
-        self._tracks: list[str] = []
+        candidates: list[str] = []
         if os.path.isdir(MUSIC_ROOT):
             for root, _dirs, files in os.walk(MUSIC_ROOT):
                 for f in files:
                     if f.lower().endswith(self._EXTS):
-                        self._tracks.append(os.path.join(root, f))
-            self._tracks.sort()
+                        candidates.append(os.path.join(root, f))
+            candidates.sort()
+
+        self._tracks: list[str] = []
+        skipped = 0
+        can_validate = pygame.mixer.get_init() is not None
+        for path in candidates:
+            if can_validate:
+                try:
+                    pygame.mixer.music.load(path)
+                except Exception as exc:
+                    log.error("Playlist: unplayable file excluded — %s (%s)", path, exc)
+                    skipped += 1
+                    continue
+            self._tracks.append(path)
+
         if self._tracks:
             log.info("Playlist: %d track(s) under %s/", len(self._tracks), MUSIC_ROOT)
+            if skipped:
+                log.warning("Playlist: %d file(s) excluded as unplayable — see above", skipped)
         else:
-            log.warning("Playlist empty — no audio files under %s/", MUSIC_ROOT)
+            log.warning("Playlist empty — no playable audio files under %s/", MUSIC_ROOT)
         self._bag: list[str] = []
         self._last: str | None = None
 
@@ -424,6 +448,15 @@ def _probe_track_seconds(path: str, default: int) -> int:
 class AudioEngine:
     _MUSIC_END = pygame.USEREVENT + 1
 
+    # If a track fails to play, retry after a short pause rather than
+    # hammering the next one immediately — and give up after enough failures
+    # in a row rather than spinning forever (e.g. a flaky SD card / USB drive
+    # taking out a whole run of files at once). Playlist already test-loads
+    # every file at startup, so in normal operation this path shouldn't fire
+    # at all; it's a safety net for failures that only show up at runtime.
+    _MAX_CONSECUTIVE_FAILURES = 5
+    _RETRY_BACKOFF_S = 0.5
+
     def __init__(self):
         self._ok      = False
         self._volume  = VOLUME_DEFAULT
@@ -431,6 +464,7 @@ class AudioEngine:
         self._on_complete = None     # callable(), fired once when the provider is exhausted
         self._playing = False
         self._paused  = False
+        self._failures = 0           # consecutive _play() failures
         self._lock    = threading.Lock()
         self._done    = threading.Event()
         self._counts  = self._load_counts()
@@ -486,7 +520,10 @@ class AudioEngine:
             self._on_complete  = on_complete
             self._playing      = True
             self._paused       = False
-        self._play(first)
+        self._failures = 0
+        if not self._play(first):
+            self._failures = 1
+            self._done.set()   # hand off to _track_manager's retry/backoff
 
     def pause(self):
         if not self._ok:
@@ -552,7 +589,10 @@ class AudioEngine:
         except Exception as exc:
             log.warning("Could not save play counts: %s", exc)
 
-    def _play(self, path: str):
+    def _play(self, path: str) -> bool:
+        """Attempt to play path. Returns False (and logs) on failure — the
+        caller decides whether/how to retry; this never blocks on _done
+        itself, so it's safe to call from any thread."""
         key = os.path.basename(path)
         self._counts[key] = self._counts.get(key, 0) + 1
         self._save_counter += 1
@@ -564,9 +604,10 @@ class AudioEngine:
             pygame.mixer.music.set_volume(self._volume / 100)
             pygame.mixer.music.play()
             log.info("Playing: %s (play #%d)", key, self._counts[key])
+            return True
         except Exception as exc:
-            log.error("Cannot play '%s': %s — skipping", path, exc)
-            self._done.set()
+            log.error("Cannot play '%s': %s", path, exc)
+            return False
 
     def notify_music_end(self):
         """Signal that the current track ended. Called from the main thread's event loop."""
@@ -574,7 +615,12 @@ class AudioEngine:
 
     def _track_manager(self):
         """Advance the playlist when a track ends, or fire on_complete once
-        the provider is naturally exhausted (not on an explicit stop())."""
+        the provider is naturally exhausted (not on an explicit stop()).
+
+        A failed _play() retries after _RETRY_BACKOFF_S (off this thread —
+        never the main loop) instead of hammering the next track immediately,
+        and gives up after _MAX_CONSECUTIVE_FAILURES in a row rather than
+        spinning forever if, say, a whole run of files turns out to be bad."""
         while True:
             self._done.wait()
             self._done.clear()
@@ -587,10 +633,23 @@ class AudioEngine:
                     self._playing = False
                     cb = self._on_complete
                     self._on_complete = None
-            if nxt:
-                self._play(nxt)
-            elif cb:
+            if cb:
+                self._failures = 0
                 cb()
+            elif nxt:
+                if self._play(nxt):
+                    self._failures = 0
+                else:
+                    self._failures += 1
+                    if self._failures >= self._MAX_CONSECUTIVE_FAILURES:
+                        log.error("AudioEngine: %d tracks in a row failed to play — "
+                                  "stopping playback for this session.", self._failures)
+                        with self._lock:
+                            self._playing = False
+                        self._failures = 0
+                    else:
+                        time.sleep(self._RETRY_BACKOFF_S)
+                        self._done.set()
 
     def shutdown(self):
         """Flush any unsaved play counts — called by app on exit."""
@@ -826,8 +885,8 @@ class MicroRaveApp:
 
         pygame.init()
         self.display   = Display()
+        self.audio     = AudioEngine()   # before Playlist: it validates files via the mixer
         self.playlists = Playlist()
-        self.audio     = AudioEngine()
         self.timer     = CountdownTimer(
             on_tick   = lambda r: self._post(self._on_tick,   r),
             on_finish = lambda:   self._post(self._on_finish),

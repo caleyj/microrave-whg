@@ -176,6 +176,11 @@ repeat, and the bag carries over between countdowns. **Next track** (`D`) skips 
 in this same shuffle during a normal countdown; it does nothing during a Popcorn/
 Potato session, since there's no shuffle to skip within.
 
+Each file in `music/` is test-loaded once at startup; anything that fails to load
+(corrupt, badly encoded, wrong extension) is logged with its full path and left out
+of the shuffle for that run. Check `microrave.log` / `sudo journalctl -u microrave`
+after adding new tracks if one seems to be missing from rotation.
+
 Popcorn and Potato each play one dedicated track **once** — no loop — and the
 countdown display is timed to that track's actual length, ending (with the "ding")
 the moment playback finishes rather than waiting out a fixed clock. Drop a file
