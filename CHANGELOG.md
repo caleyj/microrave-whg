@@ -4,6 +4,25 @@ All notable changes to the MicroRave project are documented here.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — 2026-09-27 (latest)
+
+### Fixed
+- **Relay only switched on the first command; later ones did nothing.**
+  Root cause: holding one HID session open across multiple commands (the
+  previous "hold the connection" fix) doesn't work with this class of cheap
+  relay board — the firmware appears to only latch a command when a HID
+  *session* opens, and silently ignores further writes to an already-open
+  handle. Split the two costs the earlier fixes were conflating: scanning
+  the USB bus (`_hid.enumerate`, genuinely expensive/disruptive to do
+  often) now only happens when there's no known device path; every
+  individual command still gets its own fresh open + write + close against
+  that cached path, which is a cheap local operation, not a bus re-scan,
+  and is what actually gets a command to take effect. Verified against a
+  simulated session-latching board: 5 on/off round-trips all switch
+  correctly with exactly one bus scan (at boot) and one open/close per
+  command; a simulated physical disconnect is detected and recovered on
+  the next command, still without re-scanning while a path is healthy.
+
 ## [Unreleased] — 2026-09-27 (later)
 
 ### Changed

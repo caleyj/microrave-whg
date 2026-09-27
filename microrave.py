@@ -762,14 +762,19 @@ class RelayController:
     """Drives dcttech USB-HID relay board(s) (VID 16c0:05df) as a "cooking"
     indicator: all channels ON while a countdown runs, OFF otherwise.
 
-    Connects once at startup and then HOLDS that connection for the life of
-    the app — a USB-HID handle is cheap to keep open, and closing + reopening
-    it repeatedly (as an earlier version of this class did, on every
-    countdown finish and Stop) churns the connection more than it protects
-    it. Detection only runs again when there's genuinely nothing connected:
-    at startup, or after a send has failed and the dead handle was dropped.
-    A healthy connection is never touched. Gracefully disabled if the hidapi
-    package or the hardware is missing.
+    These cheap relay-board clones commonly only latch one command per HID
+    *session* — some firmwares read the feature report when a session opens
+    and ignore later writes to a handle that's kept open, so holding one
+    connection open for repeated commands reliably switches on the first
+    write and silently does nothing after that (exactly what a held-open
+    connection looked like in testing).
+
+    So the design here splits the two costs apart: the USB bus is scanned
+    (_hid.enumerate, the actually expensive/disruptive part) only when we
+    don't already know a device path — at startup, or after a path stops
+    working — and every individual command gets its own fresh open + write +
+    close against that cached path, which is a cheap local operation, not a
+    bus re-scan, and is what gets each command to actually take effect.
 
     Protocol (pavel-a/usb-relay-hid): a 9-byte HID feature report
     [reportId=0, cmd, channel, 0*6] where cmd is 0xFE all-on / 0xFC all-off /
@@ -781,27 +786,26 @@ class RelayController:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._devs: list = []
-        self._connect_locked()
+        self._paths: list = []   # known device paths — cheap to reopen per command
+        self._discover_locked()
 
-    def _connect_locked(self) -> None:
-        """Detect and open every matching board. Caller must hold self._lock.
-        Only call this when self._devs is empty — it appends, it doesn't
-        replace, so calling it on a live connection would duplicate handles."""
+    def _discover_locked(self) -> None:
+        """Scan the USB bus for matching boards. Caller must hold self._lock.
+        This is the one relatively expensive/disruptive step — everything
+        else just reopens an already-known path."""
         if not _HID_AVAILABLE:
             log.warning("hidapi not installed — USB relay disabled.")
             return
         try:
-            for info in _hid.enumerate(RELAY_VID, RELAY_PID):
-                dev = _hid.device()
-                dev.open_path(info["path"])
-                self._devs.append(dev)
-                log.info("USB relay ready: %s serial=%s",
+            infos = _hid.enumerate(RELAY_VID, RELAY_PID)
+            self._paths = [info["path"] for info in infos]
+            for info in infos:
+                log.info("USB relay found: %s serial=%s",
                          info.get("product_string"), info.get("serial_number"))
-            if not self._devs:
+            if not self._paths:
                 log.warning("No USB relay board found (%04x:%04x).", RELAY_VID, RELAY_PID)
         except Exception as exc:
-            log.warning("USB relay init failed: %s", exc)
+            log.warning("USB relay discovery failed: %s", exc)
 
     def all_on(self) -> None:
         self._send(self._ALL_ON)
@@ -810,34 +814,32 @@ class RelayController:
         self._send(self._ALL_OFF)
 
     def close(self) -> None:
-        with self._lock:
-            for dev in self._devs:
-                try:
-                    dev.send_feature_report(bytes([0, self._ALL_OFF, 0, 0, 0, 0, 0, 0, 0]))
-                    dev.close()
-                except Exception:
-                    pass
-            self._devs = []
+        """Nothing is held open between commands — just make sure the
+        board(s) end up off."""
+        self.all_off()
 
     def _send(self, cmd: int) -> None:
         report = bytes([0, cmd, 0, 0, 0, 0, 0, 0, 0])
         with self._lock:
-            if not self._devs:
-                # Nothing connected right now — look for a board. Never runs
-                # while a connection is already up.
-                self._connect_locked()
-            alive = []
-            for dev in self._devs:
+            if not self._paths:
+                # No known board — look for one. Never runs when we already
+                # have a path, so a healthy board isn't re-scanned for.
+                self._discover_locked()
+            still_good = []
+            for path in self._paths:
+                dev = _hid.device()
                 try:
+                    dev.open_path(path)
                     dev.send_feature_report(report)
-                    alive.append(dev)
+                    still_good.append(path)
                 except Exception as exc:
-                    log.warning("USB relay connection dropped: %s", exc)
+                    log.warning("USB relay send failed (%r): %s", path, exc)
+                finally:
                     try:
                         dev.close()
                     except Exception:
                         pass
-            self._devs = alive
+            self._paths = still_good
 
 
 # =============================================================================
