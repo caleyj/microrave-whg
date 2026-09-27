@@ -1,7 +1,6 @@
 """Unit tests for CountdownTimer."""
 import threading
 import time
-import pytest
 from microrave import CountdownTimer
 
 
@@ -39,32 +38,6 @@ class TestCountdownTimer:
         r = timer.remaining
         timer.stop()
         assert r <= 9, f"Expected remaining ≤ 9 after 1.5s, got {r}"
-
-    def test_pause_stops_ticking(self):
-        timer, ticks, _ = make_timer()
-        timer.start(10)
-        time.sleep(1.2)
-        count_before = len(ticks)
-        timer.pause()
-        time.sleep(2.0)
-        count_after = len(ticks)
-        timer.stop()
-        assert count_after == count_before, (
-            f"Ticks should stop while paused: before={count_before}, after={count_after}"
-        )
-
-    def test_resume_continues_ticking(self):
-        timer, ticks, _ = make_timer()
-        timer.start(10)
-        time.sleep(1.2)
-        timer.pause()
-        count_at_pause = len(ticks)
-        time.sleep(1.5)
-        timer.resume()
-        time.sleep(1.2)
-        count_after_resume = len(ticks)
-        timer.stop()
-        assert count_after_resume > count_at_pause, "Ticks should resume after resume()"
 
     def test_stop_prevents_finish(self):
         timer, _, finished = make_timer()

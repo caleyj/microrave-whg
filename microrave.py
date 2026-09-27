@@ -316,10 +316,6 @@ class Display:
             self._colon = colon
             self._dirty = True
 
-    def show_segs(self, segs, colon: bool = False):
-        """Retained for API compatibility — segment-set rendering is unused."""
-        pass
-
     def render(self):
         """Flush pending update to screen. Call from the main thread only.
         Just blits up to 5 pre-built cells — no font rendering or blurring
@@ -463,7 +459,6 @@ class AudioEngine:
         self._provider = None        # callable() -> next track path, or None to stop
         self._on_complete = None     # callable(), fired once when the provider is exhausted
         self._playing = False
-        self._paused  = False
         self._failures = 0           # consecutive _play() failures
         self._lock    = threading.Lock()
         self._done    = threading.Event()
@@ -519,34 +514,14 @@ class AudioEngine:
             self._provider     = track_provider
             self._on_complete  = on_complete
             self._playing      = True
-            self._paused       = False
         self._failures = 0
         if not self._play(first):
             self._failures = 1
             self._done.set()   # hand off to _track_manager's retry/backoff
 
-    def pause(self):
-        if not self._ok:
-            return
-        with self._lock:
-            if not self._playing or self._paused:
-                return
-            self._paused = True
-        pygame.mixer.music.pause()
-
-    def resume(self):
-        if not self._ok:
-            return
-        with self._lock:
-            if not self._playing or not self._paused:
-                return
-            self._paused = False
-        pygame.mixer.music.unpause()
-
     def stop(self):
         with self._lock:
             self._playing     = False
-            self._paused      = False
             self._on_complete = None
         if self._ok:
             pygame.mixer.music.stop()
@@ -626,7 +601,7 @@ class AudioEngine:
             self._done.clear()
             cb = None
             with self._lock:
-                if not self._playing or self._paused:
+                if not self._playing:
                     continue
                 nxt = self._provider() if self._provider else None
                 if not nxt:
@@ -678,8 +653,6 @@ class CountdownTimer:
         self._remaining = 0
         self._lock      = threading.Lock()
         self._stop      = threading.Event()
-        self._pause     = threading.Event()
-        self._pause.set()
         self._thread: threading.Thread | None = None
 
     def start(self, seconds: int):
@@ -687,19 +660,11 @@ class CountdownTimer:
         with self._lock:
             self._remaining = max(0, seconds)
         self._stop.clear()
-        self._pause.set()
         self._thread = threading.Thread(target=self._run, name="Countdown", daemon=True)
         self._thread.start()
 
-    def pause(self):
-        self._pause.clear()
-
-    def resume(self):
-        self._pause.set()
-
     def stop(self):
         self._stop.set()
-        self._pause.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
         self._thread = None
@@ -716,9 +681,6 @@ class CountdownTimer:
 
     def _run(self):
         while not self._stop.is_set():
-            self._pause.wait()
-            if self._stop.is_set():
-                break
             with self._lock:
                 r = self._remaining
             self._on_tick(r)
@@ -765,12 +727,6 @@ class TimeEntryBuffer:
     def is_zero(self) -> bool:
         return self.to_seconds() == 0
 
-    def raw_mm(self) -> int:
-        return self._d[0] * 10 + self._d[1]
-
-    def raw_ss(self) -> int:
-        return self._d[2] * 10 + self._d[3]
-
     def set_from_seconds(self, secs: int):
         """Overwrite buffer from a seconds value — used by +30 and the presets."""
         secs = max(0, min(secs, self._MAX))
@@ -806,8 +762,11 @@ class RelayController:
     """Drives dcttech USB-HID relay board(s) (VID 16c0:05df) as a "cooking"
     indicator: all channels ON while a countdown runs, OFF otherwise.
 
-    Opens every matching board that is plugged in. Gracefully disabled if the
-    hidapi package or the hardware is missing.
+    Opens every matching board that is plugged in at construction time.
+    Gracefully disabled if the hidapi package or the hardware is missing.
+    Call rescan() to re-detect — the app does this at natural reset points
+    (a countdown finishing, Stop) rather than trusting one USB connection
+    for the whole session; see rescan()'s docstring for why.
 
     Protocol (pavel-a/usb-relay-hid): a 9-byte HID feature report
     [reportId=0, cmd, channel, 0*6] where cmd is 0xFE all-on / 0xFC all-off /
@@ -820,6 +779,12 @@ class RelayController:
     def __init__(self):
         self._lock = threading.Lock()
         self._devs: list = []
+        self._connect()
+
+    def _connect(self) -> None:
+        """(Re)detect and open every matching board. self._devs must already
+        be empty — callers that might have stale handles go through close()
+        or rescan() first."""
         if not _HID_AVAILABLE:
             log.warning("hidapi not installed — USB relay disabled.")
             return
@@ -834,6 +799,18 @@ class RelayController:
                 log.warning("No USB relay board found (%04x:%04x).", RELAY_VID, RELAY_PID)
         except Exception as exc:
             log.warning("USB relay init failed: %s", exc)
+
+    def rescan(self) -> None:
+        """Drop any open handles and re-detect + reopen the board(s) from
+        scratch, then leave them off. These cheap USB-HID relay boards can
+        silently drop their USB connection (e.g. switching an inductive
+        load can brown out the port) without the process finding out — a
+        held-open handle just goes on failing silently — so callers re-scan
+        at natural reset points (a countdown finishing, Stop) rather than
+        assuming one connection lasts the whole session."""
+        self.close()
+        self._connect()
+        self.all_off()
 
     def all_on(self) -> None:
         self._send(self._ALL_ON)
@@ -887,6 +864,7 @@ class MicroRaveApp:
         self.display   = Display()
         self.audio     = AudioEngine()   # before Playlist: it validates files via the mixer
         self.playlists = Playlist()
+        self._preset_cache = self._load_preset_cache()   # also needs the mixer up
         self.timer     = CountdownTimer(
             on_tick   = lambda r: self._post(self._on_tick,   r),
             on_finish = lambda:   self._post(self._on_finish),
@@ -981,7 +959,7 @@ class MicroRaveApp:
             # 1st press — cancel everything and park on 0000
             self.timer.stop()
             self.audio.stop()
-            self.relays.all_off()
+            self.relays.rescan()   # re-detect the board — see rescan() docstring
             self.buf.clear()
             self._state = State.ENTERING_TIME
             self.display.show("0000")
@@ -1006,6 +984,25 @@ class MicroRaveApp:
             # be up to 1s away, which reads as "did that even register?".
             self.display.show(self._fmt_countdown(self.timer.remaining))
 
+    def _load_preset_cache(self) -> dict:
+        """Resolve and probe Popcorn/Potato's dedicated tracks once, here at
+        startup, instead of on every press. pygame.mixer.Sound() fully
+        decodes a file just to measure its length — exactly the kind of
+        slow, GIL-holding call that caused the main-loop-stall bugs in the
+        shared playlist, so it doesn't get to run live on a keypress too."""
+        cache = {}
+        for name in ("popcorn", "potato"):
+            track = _find_preset_track(name)
+            if track:
+                secs = _probe_track_seconds(track, PRESET_SECONDS)
+                cache[name] = (track, secs)
+                log.info("Preset '%s': %s (~%ds)", name, os.path.basename(track), secs)
+            else:
+                cache[name] = None
+                log.warning("No %s track found in %s/ — will use the shared playlist.",
+                            name, PRESET_DIR)
+        return cache
+
     def _on_preset(self, label: str):
         log.info("Key: %s", label)
         self.audio.beep()
@@ -1014,13 +1011,13 @@ class MicroRaveApp:
         self.audio.stop()
 
         name = label.lower()   # "popcorn" / "potato"
-        track = _find_preset_track(name)
-        if track:
+        cached = self._preset_cache.get(name)
+        if cached:
             # Play the dedicated track once; the cosmetic countdown is seeded
-            # from its measured length (+1s margin) and _on_preset_track_done
+            # from its pre-measured length (+1s margin) and _on_preset_track_done
             # ends the session the moment playback actually finishes, rather
             # than waiting for that countdown to reach zero.
-            secs = _probe_track_seconds(track, PRESET_SECONDS)
+            track, secs = cached
             self.buf.set_from_seconds(secs)
             self._state = State.ENTERING_TIME
             self.display.show(self.buf.display_str())
@@ -1032,8 +1029,6 @@ class MicroRaveApp:
                 preset_session=True,  # blocks Next Track — there's nothing to skip to
             )
         else:
-            log.warning("No %s track found in %s/ — using the shared playlist.",
-                        name, PRESET_DIR)
             self.buf.set_from_seconds(PRESET_SECONDS)
             self._state = State.ENTERING_TIME
             self.display.show(self.buf.display_str())
@@ -1062,7 +1057,7 @@ class MicroRaveApp:
         self._state = State.FINISHED
         self.buf.clear()
         self.audio.ding()
-        self.relays.all_off()
+        self.relays.rescan()   # re-detect the board — see rescan() docstring
         self.display.show("0000")
         t = threading.Timer(3.0, lambda: self._post(self._go_idle))
         t.daemon = True
@@ -1071,7 +1066,6 @@ class MicroRaveApp:
     def _go_idle(self):
         if self._state == State.FINISHED:
             self._state = State.IDLE
-            self.relays.all_off()
             self._show_clock(force=True)
 
     def _flash_zero_prompt(self) -> None:

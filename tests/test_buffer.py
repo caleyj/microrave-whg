@@ -74,12 +74,6 @@ class TestTimeEntryBuffer:
         assert self.buf.display_str() == "0069"
         assert self.buf.to_seconds() == 69   # to_seconds() does normalise
 
-    def test_raw_mm_and_ss(self):
-        for d in [2, 3, 4, 5]:
-            self.buf.push(d)
-        assert self.buf.raw_mm() == 23
-        assert self.buf.raw_ss() == 45
-
     # ── set_from_seconds / _from_add30 ────────────────────────────────────────
 
     def test_set_from_seconds_marks_from_add30(self):

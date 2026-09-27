@@ -121,38 +121,40 @@ class TestFiveMinuteCap:
 
 
 # ── Popcorn / Potato one-touch presets ────────────────────────────────────────
+#
+# app._preset_cache is resolved once at startup (MicroRaveApp.__init__ calls
+# _load_preset_cache(), which is what actually touches PRESET_DIR / probes
+# file length) — see the "check for redundant code" pass that moved this off
+# the hot path. So these tests set app._preset_cache directly rather than
+# monkeypatching PRESET_DIR, which by the time a test runs is already too
+# late to affect anything, and would otherwise make these tests silently
+# depend on whatever real files happen to be sitting in this checkout's
+# presets/ folder.
 
 class TestPresets:
-    # Isolate from whatever real files a developer may have dropped into the
-    # repo's presets/ folder — these tests exercise the no-dedicated-track
-    # fallback specifically.
 
     @pytest.mark.parametrize("label", ["POPCORN", "POTATO"])
-    def test_preset_starts_immediately(self, app, monkeypatch, tmp_path, label):
-        monkeypatch.setattr(microrave, "PRESET_DIR", str(tmp_path / "empty"))
+    def test_preset_falls_back_without_a_cached_track(self, app, label):
+        app._preset_cache[label.lower()] = None
         app._post(app._on_preset, label)
         app._drain()
         assert app._state == State.COUNTING_DOWN
         assert app.timer.remaining == pytest.approx(PRESET_SECONDS, abs=1)
 
-    def test_preset_via_on_key(self, app, monkeypatch, tmp_path):
-        monkeypatch.setattr(microrave, "PRESET_DIR", str(tmp_path / "empty"))
+    def test_preset_via_on_key(self, app):
+        app._preset_cache["popcorn"] = None
         app._post(app._on_key, "POPCORN")
         app._drain()
         assert app._state == State.COUNTING_DOWN
 
 
 class TestPresetTracks:
-    """Popcorn/Potato play a dedicated file from PRESET_DIR once (no loop)
-    and end the session the moment it finishes; missing file -> falls back
-    to the shared shuffle for PRESET_SECONDS."""
+    """Popcorn/Potato play their cached dedicated track once (no loop) and
+    end the session the moment it finishes; a cache miss (nothing found at
+    startup) falls back to the shared shuffle for PRESET_SECONDS."""
 
-    def test_dedicated_track_plays_once(self, app, monkeypatch, tmp_path):
-        preset_dir = tmp_path / "presets"
-        preset_dir.mkdir()
-        track = preset_dir / "popcorn.mp3"
-        track.write_bytes(b"\x00")
-        monkeypatch.setattr(microrave, "PRESET_DIR", str(preset_dir))
+    def test_dedicated_track_plays_once(self, app, monkeypatch):
+        app._preset_cache["popcorn"] = ("/fake/presets/popcorn.mp3", 42)
 
         calls = []
         monkeypatch.setattr(app.audio, "start",
@@ -164,15 +166,12 @@ class TestPresetTracks:
         assert len(calls) == 1
         provider, on_complete = calls[0]
         # Returns the track once, then None — no loop.
-        assert provider() == str(track)
+        assert provider() == "/fake/presets/popcorn.mp3"
         assert provider() is None
         assert on_complete is not None
 
-    def test_track_finishing_ends_the_session_immediately(self, app, monkeypatch, tmp_path):
-        preset_dir = tmp_path / "presets"
-        preset_dir.mkdir()
-        (preset_dir / "potato.mp3").write_bytes(b"\x00")
-        monkeypatch.setattr(microrave, "PRESET_DIR", str(preset_dir))
+    def test_track_finishing_ends_the_session_immediately(self, app):
+        app._preset_cache["potato"] = ("/fake/presets/potato.mp3", 5)
 
         app._post(app._on_preset, "POTATO")
         app._drain()
@@ -183,12 +182,8 @@ class TestPresetTracks:
         app._drain()
         assert app._state == State.FINISHED
 
-    def test_stop_prevents_a_stale_completion_from_resurrecting_the_session(
-            self, app, monkeypatch, tmp_path):
-        preset_dir = tmp_path / "presets"
-        preset_dir.mkdir()
-        (preset_dir / "popcorn.mp3").write_bytes(b"\x00")
-        monkeypatch.setattr(microrave, "PRESET_DIR", str(preset_dir))
+    def test_stop_prevents_a_stale_completion_from_resurrecting_the_session(self, app):
+        app._preset_cache["popcorn"] = ("/fake/presets/popcorn.mp3", 5)
 
         app._post(app._on_preset, "POPCORN")
         app._drain()
@@ -200,8 +195,8 @@ class TestPresetTracks:
         app._drain()
         assert app._state == State.ENTERING_TIME   # unchanged — no resurrection
 
-    def test_missing_track_falls_back_to_shared_playlist(self, app, monkeypatch, tmp_path):
-        monkeypatch.setattr(microrave, "PRESET_DIR", str(tmp_path / "no-such-dir"))
+    def test_missing_track_falls_back_to_shared_playlist(self, app, monkeypatch):
+        app._preset_cache["potato"] = None
 
         calls = []
         monkeypatch.setattr(app.audio, "start", lambda tp, on_complete=None: calls.append(tp))
@@ -251,13 +246,10 @@ class TestNextTrack:
         app._drain()
         assert len(calls) == 2
 
-    def test_noop_during_preset_session(self, app, monkeypatch, tmp_path):
+    def test_noop_during_preset_session(self, app, monkeypatch):
         # There's only one dedicated track in a Popcorn/Potato session — no
         # "next" to skip to — so Next Track must do nothing there.
-        preset_dir = tmp_path / "presets"
-        preset_dir.mkdir()
-        (preset_dir / "popcorn.mp3").write_bytes(b"\x00")
-        monkeypatch.setattr(microrave, "PRESET_DIR", str(preset_dir))
+        app._preset_cache["popcorn"] = ("/fake/presets/popcorn.mp3", 5)
 
         calls = []
         monkeypatch.setattr(app.audio, "start", lambda tp, on_complete=None: calls.append(tp))
@@ -299,12 +291,9 @@ class TestAdd30:
         app._drain()
         assert app.display._text == app._fmt_countdown(app.timer.remaining)
 
-    def test_noop_during_preset_session(self, app, monkeypatch, tmp_path):
+    def test_noop_during_preset_session(self, app):
         # A curated Popcorn/Potato track's length isn't meant to be adjusted.
-        preset_dir = tmp_path / "presets"
-        preset_dir.mkdir()
-        (preset_dir / "potato.mp3").write_bytes(b"\x00")
-        monkeypatch.setattr(microrave, "PRESET_DIR", str(preset_dir))
+        app._preset_cache["potato"] = ("/fake/presets/potato.mp3", 5)
 
         app._post(app._on_preset, "POTATO")
         app._drain()
@@ -417,8 +406,8 @@ class TestRapidFire:
             app._drain()
         assert app._state == State.ENTERING_TIME
 
-    def test_preset_spam_no_crash(self, app, monkeypatch, tmp_path):
-        monkeypatch.setattr(microrave, "PRESET_DIR", str(tmp_path / "empty"))
+    def test_preset_spam_no_crash(self, app):
+        app._preset_cache["popcorn"] = None
         for _ in range(20):
             app._post(app._on_preset, "POPCORN")
             app._post(app._on_stop)

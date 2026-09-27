@@ -4,6 +4,43 @@ All notable changes to the MicroRave project are documented here.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — 2026-09-27
+
+### Fixed
+- **USB relay board re-detects at reset points instead of trusting one
+  connection for the whole session.** These cheap USB-HID relay boards can
+  silently drop their USB connection (e.g. switching an inductive load can
+  brown out the port); a held-open device handle then just fails silently
+  forever after, with no way to recover short of restarting the app.
+  `RelayController.rescan()` closes any open handles and re-enumerates +
+  reopens the board(s) from scratch, then leaves them off. Called from
+  `_on_finish` (a countdown completing) and `_on_stop`'s cancel branch
+  (Stop/reset) — the two natural points where the relay is expected to be
+  off anyway, so re-detecting there is free.
+- **A third source of "main loop stall": probing Popcorn/Potato's track
+  length on every press.** `pygame.mixer.Sound(path).get_length()` fully
+  decodes the file just to measure it — the same category of slow,
+  GIL-holding call already fixed twice this month for the shared playlist,
+  except this one ran live on every single Popcorn/Potato press, not just
+  once. Popcorn/Potato's dedicated tracks are now resolved and probed once
+  at startup (`MicroRaveApp._load_preset_cache()`) instead of inside
+  `_on_preset()`.
+
+### Changed — redundant code found while investigating the above
+- Removed `AudioEngine.pause()`/`resume()` and `CountdownTimer.pause()`/
+  `resume()` — leftover from the original door-based design (open door
+  pauses, close door resumes) that predates this build; nothing has called
+  them since the door was removed. `AudioEngine._paused` and
+  `CountdownTimer._pause` (an Event that was permanently set, so every
+  `.wait()` on it was a no-op) went with them.
+- Removed `Display.show_segs()` (a no-op stub left over from the old
+  hand-drawn-segment renderer) and `TimeEntryBuffer.raw_mm()`/`raw_ss()`
+  (unused since the DJ/easter-egg logging that called them was removed).
+- Removed the now-redundant second `relays.all_off()` in `_go_idle()` —
+  `_on_finish()` (now `rescan()`, which itself ends with `all_off()`)
+  already turns them off 3 seconds earlier, and nothing can turn them back
+  on in between.
+
 ## [Unreleased] — 2026-09-20
 
 ### Fixed
