@@ -139,6 +139,7 @@ KEYPAD_MAP = {
 # dcttech USB-HID relay board — "cooking" indicator lamp
 RELAY_VID = 0x16c0
 RELAY_PID = 0x05df
+RELAY_SEND_TIMEOUT = 0.5   # seconds — see RelayController._send_one
 
 MUSIC_ROOT        = "music"          # single shared playlist folder
 SOUNDS_DIR        = "sounds"
@@ -825,21 +826,38 @@ class RelayController:
                 # No known board — look for one. Never runs when we already
                 # have a path, so a healthy board isn't re-scanned for.
                 self._discover_locked()
-            still_good = []
-            for path in self._paths:
-                dev = _hid.device()
+            self._paths = [p for p in self._paths if self._send_one(p, report)]
+
+    def _send_one(self, path, report: bytes) -> bool:
+        """Open, write, and close one board's handle, but never wait on it
+        past RELAY_SEND_TIMEOUT. A board mid-USB-reset can leave open_path()
+        blocked in the kernel for tens of seconds with no exception raised —
+        that once froze the whole dispatch thread (every button, every
+        countdown) for 20+ seconds. Running the attempt on its own thread
+        lets us abandon it on a timeout instead of hanging with it."""
+        result = {"ok": False}
+
+        def _attempt():
+            dev = _hid.device()
+            try:
+                dev.open_path(path)
+                dev.send_feature_report(report)
+                result["ok"] = True
+            except Exception as exc:
+                log.warning("USB relay send failed (%r): %s", path, exc)
+            finally:
                 try:
-                    dev.open_path(path)
-                    dev.send_feature_report(report)
-                    still_good.append(path)
-                except Exception as exc:
-                    log.warning("USB relay send failed (%r): %s", path, exc)
-                finally:
-                    try:
-                        dev.close()
-                    except Exception:
-                        pass
-            self._paths = still_good
+                    dev.close()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_attempt, name="RelaySend", daemon=True)
+        t.start()
+        t.join(RELAY_SEND_TIMEOUT)
+        if t.is_alive():
+            log.warning("USB relay send timed out (%r) — dropping path", path)
+            return False
+        return result["ok"]
 
 
 # =============================================================================
