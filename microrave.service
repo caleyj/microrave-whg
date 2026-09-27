@@ -7,15 +7,15 @@ Wants=graphical.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/home/pi/MicroRave
+WorkingDirectory=/home/scotchhop/MicroRave
 Environment=DISPLAY=:0
-Environment=XAUTHORITY=/home/pi/.Xauthority
+Environment=XAUTHORITY=/home/scotchhop/.Xauthority
 # Root has no session of its own — point it at scotchhop's (uid 1000) already-running
 # pipewire/pulseaudio sockets, or SDL2 silently falls back to raw ALSA.
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 
 # The wrapper script waits for the display before launching
-ExecStart=/home/pi/MicroRave/start_microrave.sh
+ExecStart=/home/scotchhop/MicroRave/start_microrave.sh
 
 # Always restart — covers crashes AND power cuts
 Restart=always

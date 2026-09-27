@@ -4,9 +4,9 @@
 # Called by systemd — do not run this directly.
 
 export DISPLAY=:0
-export XAUTHORITY=/home/pi/.Xauthority
+export XAUTHORITY=/home/scotchhop/.Xauthority
 
-cd /home/pi/MicroRave
+cd /home/scotchhop/MicroRave
 
 # Block until XWayland's Unix socket exists (desktop is up and accepting connections)
 echo "MicroRave launcher: waiting for display..."
