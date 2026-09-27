@@ -762,11 +762,14 @@ class RelayController:
     """Drives dcttech USB-HID relay board(s) (VID 16c0:05df) as a "cooking"
     indicator: all channels ON while a countdown runs, OFF otherwise.
 
-    Opens every matching board that is plugged in at construction time.
-    Gracefully disabled if the hidapi package or the hardware is missing.
-    Call rescan() to re-detect — the app does this at natural reset points
-    (a countdown finishing, Stop) rather than trusting one USB connection
-    for the whole session; see rescan()'s docstring for why.
+    Connects once at startup and then HOLDS that connection for the life of
+    the app — a USB-HID handle is cheap to keep open, and closing + reopening
+    it repeatedly (as an earlier version of this class did, on every
+    countdown finish and Stop) churns the connection more than it protects
+    it. Detection only runs again when there's genuinely nothing connected:
+    at startup, or after a send has failed and the dead handle was dropped.
+    A healthy connection is never touched. Gracefully disabled if the hidapi
+    package or the hardware is missing.
 
     Protocol (pavel-a/usb-relay-hid): a 9-byte HID feature report
     [reportId=0, cmd, channel, 0*6] where cmd is 0xFE all-on / 0xFC all-off /
@@ -779,12 +782,12 @@ class RelayController:
     def __init__(self):
         self._lock = threading.Lock()
         self._devs: list = []
-        self._connect()
+        self._connect_locked()
 
-    def _connect(self) -> None:
-        """(Re)detect and open every matching board. self._devs must already
-        be empty — callers that might have stale handles go through close()
-        or rescan() first."""
+    def _connect_locked(self) -> None:
+        """Detect and open every matching board. Caller must hold self._lock.
+        Only call this when self._devs is empty — it appends, it doesn't
+        replace, so calling it on a live connection would duplicate handles."""
         if not _HID_AVAILABLE:
             log.warning("hidapi not installed — USB relay disabled.")
             return
@@ -799,18 +802,6 @@ class RelayController:
                 log.warning("No USB relay board found (%04x:%04x).", RELAY_VID, RELAY_PID)
         except Exception as exc:
             log.warning("USB relay init failed: %s", exc)
-
-    def rescan(self) -> None:
-        """Drop any open handles and re-detect + reopen the board(s) from
-        scratch, then leave them off. These cheap USB-HID relay boards can
-        silently drop their USB connection (e.g. switching an inductive
-        load can brown out the port) without the process finding out — a
-        held-open handle just goes on failing silently — so callers re-scan
-        at natural reset points (a countdown finishing, Stop) rather than
-        assuming one connection lasts the whole session."""
-        self.close()
-        self._connect()
-        self.all_off()
 
     def all_on(self) -> None:
         self._send(self._ALL_ON)
@@ -831,11 +822,22 @@ class RelayController:
     def _send(self, cmd: int) -> None:
         report = bytes([0, cmd, 0, 0, 0, 0, 0, 0, 0])
         with self._lock:
+            if not self._devs:
+                # Nothing connected right now — look for a board. Never runs
+                # while a connection is already up.
+                self._connect_locked()
+            alive = []
             for dev in self._devs:
                 try:
                     dev.send_feature_report(report)
+                    alive.append(dev)
                 except Exception as exc:
-                    log.warning("USB relay send error: %s", exc)
+                    log.warning("USB relay connection dropped: %s", exc)
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+            self._devs = alive
 
 
 # =============================================================================
@@ -959,7 +961,7 @@ class MicroRaveApp:
             # 1st press — cancel everything and park on 0000
             self.timer.stop()
             self.audio.stop()
-            self.relays.rescan()   # re-detect the board — see rescan() docstring
+            self.relays.all_off()
             self.buf.clear()
             self._state = State.ENTERING_TIME
             self.display.show("0000")
@@ -1057,7 +1059,7 @@ class MicroRaveApp:
         self._state = State.FINISHED
         self.buf.clear()
         self.audio.ding()
-        self.relays.rescan()   # re-detect the board — see rescan() docstring
+        self.relays.all_off()
         self.display.show("0000")
         t = threading.Timer(3.0, lambda: self._post(self._go_idle))
         t.daemon = True

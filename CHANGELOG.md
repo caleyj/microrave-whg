@@ -4,6 +4,23 @@ All notable changes to the MicroRave project are documented here.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — 2026-09-27 (later)
+
+### Changed
+- **Relay: hold the connection instead of churning it on every reset.**
+  The previous fix (below) closed and reopened the USB-HID connection on
+  every countdown finish and Stop — meant to recover from a dropped
+  connection, but closing/reopening a *healthy* connection repeatedly is
+  itself a plausible way to destabilize a flaky USB link. Now:
+  connects once at boot as before, and simply **holds** that connection —
+  `all_on()`/`all_off()` never touch it while it's alive. `_send()` only
+  looks for a board when `self._devs` is empty, which happens in exactly
+  two cases: at startup, or right after a send has failed and the dead
+  handle was dropped. A healthy connection is never closed or reopened.
+  `_on_finish()` / `_on_stop()` are back to plain `all_off()` — the
+  self-healing now lives in `_send()` itself, so it applies everywhere the
+  relay is used, not just those two call sites.
+
 ## [Unreleased] — 2026-09-27
 
 ### Fixed
