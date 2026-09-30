@@ -19,7 +19,7 @@ ExecStart=/home/scotchhop/MicroRave/start_microrave.sh
 
 # Always restart — covers crashes AND power cuts
 Restart=always
-RestartSec=5
+RestartSec=10
 
 [Install]
 WantedBy=graphical.target
