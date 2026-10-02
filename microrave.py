@@ -129,7 +129,7 @@ KEYPAD_MAP = {
     pygame.K_a: "POPCORN",
     pygame.K_b: "POTATO",
     pygame.K_c: "ADD30",
-    pygame.K_d: "NEXTTRACK",
+    pygame.K_e: "NEXTTRACK",
 }
 
 # =============================================================================

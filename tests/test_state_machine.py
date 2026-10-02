@@ -86,7 +86,7 @@ class TestKeypadMapping:
         assert microrave.KEYPAD_MAP[microrave.pygame.K_a] == "POPCORN"
         assert microrave.KEYPAD_MAP[microrave.pygame.K_b] == "POTATO"
         assert microrave.KEYPAD_MAP[microrave.pygame.K_c] == "ADD30"
-        assert microrave.KEYPAD_MAP[microrave.pygame.K_d] == "NEXTTRACK"
+        assert microrave.KEYPAD_MAP[microrave.pygame.K_e] == "NEXTTRACK"
 
     def test_start_and_stop_keys(self):
         assert microrave.KEYPAD_MAP[microrave.pygame.K_RETURN] == "START"
