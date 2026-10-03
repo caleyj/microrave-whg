@@ -1026,6 +1026,9 @@ class MicroRaveApp:
         return cache
 
     def _on_preset(self, label: str):
+        if self._state == State.COUNTING_DOWN:
+            log.info("Key: %s ignored — countdown running", label)
+            return
         log.info("Key: %s", label)
         self.audio.beep()
         self._cancel_entry_timer()
@@ -1215,6 +1218,9 @@ class MicroRaveApp:
                         label = self._keymap.get(ev.key)
                         if label:
                             self._post(self._on_key, label)
+                        else:
+                            log.info("Unmapped key ignored: %s (code %d)",
+                                     pygame.key.name(ev.key), ev.key)
 
                 if self._state == State.IDLE:
                     self._show_clock()

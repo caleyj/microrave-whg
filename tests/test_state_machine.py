@@ -147,6 +147,35 @@ class TestPresets:
         app._drain()
         assert app._state == State.COUNTING_DOWN
 
+    @pytest.mark.parametrize("label", ["POPCORN", "POTATO"])
+    def test_preset_ignored_while_counting_down(self, app, monkeypatch, label):
+        for d in (1, 0, 0):
+            app._post(app._on_digit, d)
+        app._post(app._on_start)
+        app._drain()
+        assert app._state == State.COUNTING_DOWN
+        before = app.timer.remaining
+
+        stops = []
+        monkeypatch.setattr(app.audio, "stop", lambda *a, **k: stops.append(1))
+        app._post(app._on_preset, label)
+        app._drain()
+
+        assert app._state == State.COUNTING_DOWN
+        assert app.timer.remaining == pytest.approx(before, abs=2)
+        assert stops == []
+
+    def test_preset_works_again_after_stop(self, app):
+        app._preset_cache["potato"] = None
+        for d in (1, 0, 0):
+            app._post(app._on_digit, d)
+        app._post(app._on_start)
+        app._post(app._on_stop)   # 1st press: cancel and park on 0000
+        app._post(app._on_preset, "POTATO")
+        app._drain()
+        assert app._state == State.COUNTING_DOWN
+        assert app.timer.remaining == pytest.approx(PRESET_SECONDS, abs=1)
+
 
 class TestPresetTracks:
     """Popcorn/Potato play their cached dedicated track once (no loop) and
