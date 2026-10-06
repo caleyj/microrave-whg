@@ -158,6 +158,14 @@ ENTRY_IDLE_TIMEOUT  = 60    # seconds on 0000 screen with no input before return
 # Missing file -> falls back to the shared shuffle (logged as a warning).
 PRESET_DIR = "presets"
 
+# Easter eggs: typing these exact digits then START plays the named track
+# first (file name, looked up anywhere under MUSIC_ROOT), then the normal
+# shuffle continues. Keys are the 4 characters shown on the display, so
+# 1-1-1 is "0111". Typed digits only — +30 never triggers one.
+EASTER_EGGS = {
+    "0111": "Timmy Trumpet x Marnik x Ely Oaks Sound of da Police.mp3",
+}
+
 # =============================================================================
 # DISPLAY  —  DSEG7 "real 7-segment" font, green on black
 # =============================================================================
@@ -409,6 +417,14 @@ class Playlist:
         self._last = track
         log.info("Next: %s (%d left in bag)", os.path.basename(track), len(self._bag))
         return track
+
+    def find_track(self, filename: str) -> str | None:
+        """Playable track whose file name matches `filename` (case-insensitive)."""
+        want = filename.lower()
+        for path in self._tracks:
+            if os.path.basename(path).lower() == want:
+                return path
+        return None
 
 
 def _find_preset_track(name: str) -> str | None:
@@ -965,12 +981,29 @@ class MicroRaveApp:
         log.info("Key: START")
         self.audio.beep()
         if self._state == State.ENTERING_TIME and not self.buf.is_zero():
-            self._begin_countdown()
+            self._begin_countdown(track_provider=self._easter_egg_provider())
         elif self._state in (State.IDLE, State.ENTERING_TIME) and self.buf.is_zero():
             # START with no time entered — prompt by flashing 0000
             self._state = State.ENTERING_TIME
             self._flash_zero_prompt()
             self._start_entry_timer()
+
+    def _easter_egg_provider(self):
+        """Track provider that plays an easter-egg track first, then the
+        normal shuffle — or None if the typed digits aren't an egg code."""
+        if self.buf._from_add30:
+            return None
+        code = self.buf.display_str()
+        name = EASTER_EGGS.get(code)
+        if not name:
+            return None
+        track = self.playlists.find_track(name)
+        if not track:
+            log.warning("Easter egg %s: '%s' isn't in the playlist — normal shuffle.", code, name)
+            return None
+        log.info("Easter egg %s: playing %s first.", code, name)
+        first = [track]
+        return lambda: first.pop(0) if first else self.playlists.next_track()
 
     def _on_stop(self):
         log.info("Key: STOP")

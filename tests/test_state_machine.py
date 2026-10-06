@@ -238,6 +238,65 @@ class TestPresetTracks:
         assert calls[0] == app.playlists.next_track
 
 
+# ── Easter eggs ────────────────────────────────────────────────────────────────
+
+class TestEasterEggs:
+    """Typing an egg code then START plays that track first, then the normal
+    shuffle; anything else (other digits, +30, missing track) is untouched."""
+
+    EGG_NAME = "Timmy Trumpet x Marnik x Ely Oaks Sound of da Police.mp3"
+    EGG_PATH = "music/sets/" + EGG_NAME
+
+    def _capture_start(self, app, monkeypatch):
+        calls = []
+        monkeypatch.setattr(app.audio, "start",
+                            lambda tp, on_complete=None: calls.append(tp))
+        return calls
+
+    def test_code_plays_egg_first_then_shuffle(self, app, monkeypatch):
+        app.playlists._tracks = [self.EGG_PATH, "music/other.mp3"]
+        calls = self._capture_start(app, monkeypatch)
+        start_countdown(app, 1, 1, 1)
+
+        assert app._state == State.COUNTING_DOWN
+        provider = calls[0]
+        assert provider() == self.EGG_PATH
+        assert provider() in app.playlists._tracks   # shuffle takes over
+
+    def test_lookup_is_case_insensitive(self, app, monkeypatch):
+        app.playlists._tracks = ["music/" + self.EGG_NAME.upper()]
+        calls = self._capture_start(app, monkeypatch)
+        start_countdown(app, 1, 1, 1)
+        assert calls[0]() == "music/" + self.EGG_NAME.upper()
+
+    def test_other_digits_use_normal_shuffle(self, app, monkeypatch):
+        app.playlists._tracks = [self.EGG_PATH]
+        calls = self._capture_start(app, monkeypatch)
+        start_countdown(app, 1, 1, 2)
+        assert calls[0] == app.playlists.next_track
+
+    def test_same_seconds_different_digits_does_not_trigger(self, app, monkeypatch):
+        # 0071 and 0111 are both 71s — only the exact typed digits count.
+        app.playlists._tracks = [self.EGG_PATH]
+        calls = self._capture_start(app, monkeypatch)
+        start_countdown(app, 7, 1)
+        assert calls[0] == app.playlists.next_track
+
+    def test_add30_never_triggers_an_egg(self, app, monkeypatch):
+        app.playlists._tracks = [self.EGG_PATH]
+        calls = self._capture_start(app, monkeypatch)
+        app._post(app._on_add_30)
+        app._drain()
+        assert calls[0] == app.playlists.next_track
+
+    def test_missing_track_falls_back_to_shuffle(self, app, monkeypatch):
+        app.playlists._tracks = ["music/other.mp3"]
+        calls = self._capture_start(app, monkeypatch)
+        start_countdown(app, 1, 1, 1)
+        assert app._state == State.COUNTING_DOWN
+        assert calls[0] == app.playlists.next_track
+
+
 # ── Next track ─────────────────────────────────────────────────────────────────
 
 class TestNextTrack:
