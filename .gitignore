@@ -14,3 +14,4 @@ music/
 *.old
 playcounts.jso
 microrave.log.old
+microrave_stall.log

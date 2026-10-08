@@ -37,6 +37,7 @@ Run headless (no desktop session):
 
 from __future__ import annotations
 
+import faulthandler
 import glob
 import json
 import logging
@@ -44,16 +45,11 @@ import os
 import queue
 import random
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
 from enum import Enum, auto
-
-try:
-    import hid as _hid
-    _HID_AVAILABLE = True
-except ImportError:
-    _HID_AVAILABLE = False
 
 import pygame
 
@@ -140,8 +136,14 @@ KEYPAD_MAP = {
 # dcttech USB-HID relay board — "cooking" indicator lamp
 RELAY_VID = 0x16c0
 RELAY_PID = 0x05df
-RELAY_SEND_TIMEOUT = 0.5   # seconds — see RelayController._send_one
+RELAY_SEND_TIMEOUT = 1.5   # seconds — hard deadline for one relay_helper.py call
+RELAY_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay_helper.py")
 RELAY_RESCAN_INTERVAL = 5.0   # seconds between bus scans while no board is found
+
+# Main-loop freeze tracer: if the loop goes this long without ticking, every
+# thread's stack is written to STALL_TRACE_FILE (see StallTracer).
+STALL_TRACE_SECONDS = 2.0
+STALL_TRACE_FILE    = "microrave_stall.log"
 
 MUSIC_ROOT        = "music"          # single shared playlist folder
 SOUNDS_DIR        = "sounds"
@@ -774,6 +776,48 @@ _STOP_SENTINEL = object()
 
 
 # =============================================================================
+# STALL TRACER
+# =============================================================================
+
+class StallTracer:
+    """Writes every thread's stack to a file if the main loop goes `seconds`
+    without calling pet(). faulthandler's timer runs in C, so it fires even
+    when a blocking call is holding the GIL — which a Python watchdog thread
+    can't do — and the stacks show exactly which call the freeze is in."""
+
+    def __init__(self, path: str, seconds: float, enable_fatal: bool = True):
+        self._seconds = seconds
+        self._file = None
+        self._fatal = False
+        try:
+            self._file = open(path, "a")
+            if enable_fatal:
+                faulthandler.enable(file=self._file)   # also dump if C code crashes
+                self._fatal = True
+        except OSError as exc:
+            log.warning("Stall tracer disabled (%s): %s", path, exc)
+            self._file = None
+
+    def pet(self) -> None:
+        if self._file:
+            faulthandler.dump_traceback_later(self._seconds, repeat=False, file=self._file)
+
+    def mark(self, note: str) -> None:
+        """Timestamped line in the dump file, so a dump can be matched to the log."""
+        if self._file:
+            self._file.write("--- %s %s ---\n" % (datetime.now().isoformat(timespec="seconds"), note))
+            self._file.flush()
+
+    def stop(self) -> None:
+        if self._file:
+            faulthandler.cancel_dump_traceback_later()
+            if self._fatal:
+                faulthandler.disable()
+            self._file.close()
+            self._file = None
+
+
+# =============================================================================
 # RELAY CONTROLLER  (dcttech USB-HID relay board — "cooking" lamp)
 # =============================================================================
 
@@ -819,19 +863,18 @@ class RelayController:
     """Drives dcttech USB-HID relay board(s) (VID 16c0:05df) as a "cooking"
     indicator: all channels ON while a countdown runs, OFF otherwise.
 
+    All USB I/O runs in relay_helper.py, a short-lived child process with a
+    hard deadline (RELAY_SEND_TIMEOUT), never in this process. A board stuck
+    mid-USB-reset can block a kernel call for ~20s, and in-process that froze
+    every thread — buttons, display and audio — even when the call was made
+    from a worker thread. A child can hang alone and simply be killed.
+
     These cheap relay-board clones commonly only latch one command per HID
     *session* — some firmwares read the feature report when a session opens
-    and ignore later writes to a handle that's kept open, so holding one
-    connection open for repeated commands reliably switches on the first
-    write and silently does nothing after that (exactly what a held-open
-    connection looked like in testing).
-
-    So the design here splits the two costs apart: the USB bus is scanned
-    (_hid.enumerate, the actually expensive/disruptive part) only when we
-    don't already know a device path — at startup, or after a path stops
-    working — and every individual command gets its own fresh open + write +
-    close against that cached path, which is a cheap local operation, not a
-    bus re-scan, and is what gets each command to actually take effect.
+    and ignore later writes to a handle that's kept open — so the helper
+    gives every command a fresh open + write + close against a cached path.
+    The USB bus is only scanned (the expensive/disruptive step) when no path
+    is known: at startup, or after a path stops working.
 
     Protocol (pavel-a/usb-relay-hid): a 9-byte HID feature report
     [reportId=0, cmd, channel, 0*6] where cmd is 0xFE all-on / 0xFC all-off /
@@ -843,30 +886,67 @@ class RelayController:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._paths: list = []   # known device paths — cheap to reopen per command
-        self._next_scan = 0.0    # monotonic time before which an empty scan isn't repeated
-        self._discover_locked()
+        self._paths: list[str] = []   # known device paths
+        self._next_scan = 0.0         # monotonic time before which an empty scan isn't repeated
+        self._stuck: subprocess.Popen | None = None   # helper that outlived its deadline
+        self._disabled = False
+        with self._lock:
+            self._scan_locked()
 
-    def _discover_locked(self) -> None:
-        """Scan the USB bus for matching boards. Caller must hold self._lock.
-        This is the one relatively expensive/disruptive step — everything
-        else just reopens an already-known path."""
-        if not _HID_AVAILABLE:
-            log.warning("hidapi not installed — USB relay disabled.")
-            return
+    def _run_helper(self, *args) -> dict | None:
+        """Run relay_helper.py with a hard deadline. Returns its JSON reply,
+        or None if it timed out, couldn't start or gave unreadable output
+        (all logged here). A helper that outlives its deadline is killed and
+        reaped in the background; while it is still stuck in the kernel no new
+        one is started, so calls fail fast instead of piling up."""
+        if self._stuck is not None:
+            if self._stuck.poll() is None:
+                log.warning("USB relay helper from an earlier call is still stuck — skipping.")
+                return None
+            self._stuck = None
         try:
-            infos = _hid.enumerate(RELAY_VID, RELAY_PID)
-            self._paths = [info["path"] for info in infos]
-            for info in infos:
-                log.info("USB relay found: %s serial=%s",
-                         info.get("product_string"), info.get("serial_number"))
+            proc = subprocess.Popen([sys.executable, RELAY_HELPER, *map(str, args)],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except OSError as exc:
+            log.warning("USB relay helper could not start: %s", exc)
+            return None
+        try:
+            out, err = proc.communicate(timeout=RELAY_SEND_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            self._stuck = proc
+            threading.Thread(target=proc.communicate, name="RelayReaper", daemon=True).start()
+            log.warning("USB relay helper timed out after %.1fs (%s) — %s",
+                        RELAY_SEND_TIMEOUT, " ".join(map(str, args[:1])),
+                        _usb_presence(RELAY_VID, RELAY_PID))
+            return None
+        try:
+            return json.loads(out)
+        except ValueError:
+            log.warning("USB relay helper gave unreadable output (exit %s): %s",
+                        proc.returncode, (err or out).strip()[-200:])
+            return None
+
+    def _scan_locked(self) -> None:
+        """Scan the USB bus for matching boards. Caller must hold self._lock."""
+        res = self._run_helper("scan")
+        self._paths = []
+        if res is not None:
+            if res.get("error") == "hidapi not installed":
+                log.warning("hidapi not installed — USB relay disabled.")
+                self._disabled = True
+                return
+            if "error" in res:
+                log.warning("USB relay scan failed: %s", res["error"])
+            boards = res.get("boards", [])
+            self._paths = [b["path"] for b in boards]
+            for b in boards:
+                log.info("USB relay found: %s serial=%s", b.get("product"), b.get("serial"))
             if not self._paths:
                 log.warning("No USB relay board found (%04x:%04x) — %s",
                             RELAY_VID, RELAY_PID, _usb_presence(RELAY_VID, RELAY_PID))
-        except Exception as exc:
-            log.warning("USB relay discovery failed: %s", exc)
         # A scan that finds nothing isn't repeated on every key press — a
-        # missing board would otherwise cost a bus scan per press.
+        # missing board would otherwise cost a helper launch per press.
         self._next_scan = 0.0 if self._paths else time.monotonic() + RELAY_RESCAN_INTERVAL
 
     def all_on(self) -> None:
@@ -881,47 +961,26 @@ class RelayController:
         self.all_off()
 
     def _send(self, cmd: int) -> None:
-        report = bytes([0, cmd, 0, 0, 0, 0, 0, 0, 0])
         with self._lock:
+            if self._disabled:
+                return
             if not self._paths and time.monotonic() >= self._next_scan:
-                # No known board — look for one. Never runs when we already
-                # have a path, so a healthy board isn't re-scanned for, and
-                # backs off after an empty scan while the board is missing.
-                self._discover_locked()
-            self._paths = [p for p in self._paths if self._send_one(p, report)]
-
-    def _send_one(self, path, report: bytes) -> bool:
-        """Open, write, and close one board's handle, but never wait on it
-        past RELAY_SEND_TIMEOUT. A board mid-USB-reset can leave open_path()
-        blocked in the kernel for tens of seconds with no exception raised —
-        that once froze the whole dispatch thread (every button, every
-        countdown) for 20+ seconds. Running the attempt on its own thread
-        lets us abandon it on a timeout instead of hanging with it."""
-        result = {"ok": False}
-
-        def _attempt():
-            dev = _hid.device()
-            try:
-                dev.open_path(path)
-                dev.send_feature_report(report)
-                result["ok"] = True
-            except Exception as exc:
-                log.warning("USB relay send failed (%r): %s — %s", path, exc,
-                            _usb_presence(RELAY_VID, RELAY_PID))
-            finally:
-                try:
-                    dev.close()
-                except Exception:
-                    pass
-
-        t = threading.Thread(target=_attempt, name="RelaySend", daemon=True)
-        t.start()
-        t.join(RELAY_SEND_TIMEOUT)
-        if t.is_alive():
-            log.warning("USB relay send timed out (%r) — dropping path — %s", path,
-                        _usb_presence(RELAY_VID, RELAY_PID))
-            return False
-        return result["ok"]
+                self._scan_locked()
+            if self._disabled or not self._paths:
+                return
+            res = self._run_helper("send", cmd, *self._paths)
+            if res is None:
+                log.warning("USB relay send did not complete — dropping %r", self._paths)
+                self._paths = []
+                return
+            good = []
+            for r in res.get("results", []):
+                if r.get("ok"):
+                    good.append(r["path"])
+                else:
+                    log.warning("USB relay send failed (%r): %s — %s", r.get("path"),
+                                r.get("error"), _usb_presence(RELAY_VID, RELAY_PID))
+            self._paths = good
 
 
 # =============================================================================
@@ -1279,7 +1338,9 @@ class MicroRaveApp:
     def run(self):
         log.info("Running — Ctrl+C or Esc to quit.")
         self._start_scheduling_watchdog()
-        last_iter = time.monotonic()
+        tracer = StallTracer(STALL_TRACE_FILE, STALL_TRACE_SECONDS)
+        last_iter = last_pet = time.monotonic()
+        tracer.pet()
         try:
             while True:
                 now = time.monotonic()
@@ -1287,7 +1348,12 @@ class MicroRaveApp:
                 # Main loop targets 50ms (20fps). >150ms means we hung — possible audio cause.
                 if gap > 0.15:
                     log.warning("Main loop stall: %.0fms gap (target 50ms)", gap * 1000)
+                if gap >= STALL_TRACE_SECONDS:
+                    tracer.mark("main loop resumed after %.1fs" % gap)
                 last_iter = now
+                if now - last_pet >= 0.5:
+                    tracer.pet()
+                    last_pet = now
                 for ev in pygame.event.get():
                     if ev.type == pygame.QUIT:
                         return
@@ -1312,6 +1378,7 @@ class MicroRaveApp:
         except KeyboardInterrupt:
             pass
         finally:
+            tracer.stop()
             self._shutdown()
 
     def _shutdown(self):

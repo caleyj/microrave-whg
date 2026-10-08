@@ -45,8 +45,9 @@ sys.modules['pygame'] = _pygame
 # ── Now safe to import microrave ──────────────────────────────────────────────
 import microrave as _mr
 
-# hidapi is not installed on the test host, so RelayController self-disables
-# (_HID_AVAILABLE is False). Its all_on()/all_off()/close() are then safe no-ops.
+# hidapi is not installed on the test host, so relay_helper.py reports that and
+# RelayController disables itself. Its all_on()/all_off()/close() are then safe
+# no-ops. (test_relay.py exercises the real helper against tests/fake_hid.)
 
 # Redirect playcounts.json to /tmp so tests don't need write access to the
 # production file (which may be root-owned when the systemd service has run).
