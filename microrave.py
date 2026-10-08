@@ -37,6 +37,7 @@ Run headless (no desktop session):
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -776,6 +777,44 @@ _STOP_SENTINEL = object()
 # RELAY CONTROLLER  (dcttech USB-HID relay board — "cooking" lamp)
 # =============================================================================
 
+def _usb_presence(vid: int, pid: int, base: str = "/sys/bus/usb/devices") -> str:
+    """Read-only sysfs check of whether a USB device is on the bus and what
+    the kernel did with its interfaces. Tells "board gone from the bus" apart
+    from "board present but the HID driver never bound", which need different
+    fixes."""
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return "USB sysfs unavailable"
+
+    def read(path):
+        try:
+            with open(path) as f:
+                return f.read().strip().lower()
+        except OSError:
+            return None
+
+    found = []
+    for name in names:
+        if ":" in name:
+            continue   # interface entries — only look at devices
+        dev = os.path.join(base, name)
+        if read(os.path.join(dev, "idVendor")) != "%04x" % vid:
+            continue
+        if read(os.path.join(dev, "idProduct")) != "%04x" % pid:
+            continue
+        ifaces = []
+        for iface in sorted(glob.glob(os.path.join(dev, name + ":*"))):
+            drv_link = os.path.join(iface, "driver")
+            driver = os.path.basename(os.path.realpath(drv_link)) if os.path.exists(drv_link) else "none"
+            hidraw = "yes" if glob.glob(os.path.join(iface, "*", "hidraw", "hidraw*")) else "no"
+            ifaces.append("%s driver=%s hidraw=%s" % (os.path.basename(iface), driver, hidraw))
+        found.append("%s (%s)" % (name, "; ".join(ifaces) or "no interfaces"))
+    if not found:
+        return "device NOT on the USB bus"
+    return "device IS on the USB bus at " + ", ".join(found)
+
+
 class RelayController:
     """Drives dcttech USB-HID relay board(s) (VID 16c0:05df) as a "cooking"
     indicator: all channels ON while a countdown runs, OFF otherwise.
@@ -822,7 +861,8 @@ class RelayController:
                 log.info("USB relay found: %s serial=%s",
                          info.get("product_string"), info.get("serial_number"))
             if not self._paths:
-                log.warning("No USB relay board found (%04x:%04x).", RELAY_VID, RELAY_PID)
+                log.warning("No USB relay board found (%04x:%04x) — %s",
+                            RELAY_VID, RELAY_PID, _usb_presence(RELAY_VID, RELAY_PID))
         except Exception as exc:
             log.warning("USB relay discovery failed: %s", exc)
         # A scan that finds nothing isn't repeated on every key press — a
@@ -866,7 +906,8 @@ class RelayController:
                 dev.send_feature_report(report)
                 result["ok"] = True
             except Exception as exc:
-                log.warning("USB relay send failed (%r): %s", path, exc)
+                log.warning("USB relay send failed (%r): %s — %s", path, exc,
+                            _usb_presence(RELAY_VID, RELAY_PID))
             finally:
                 try:
                     dev.close()
@@ -877,7 +918,8 @@ class RelayController:
         t.start()
         t.join(RELAY_SEND_TIMEOUT)
         if t.is_alive():
-            log.warning("USB relay send timed out (%r) — dropping path", path)
+            log.warning("USB relay send timed out (%r) — dropping path — %s", path,
+                        _usb_presence(RELAY_VID, RELAY_PID))
             return False
         return result["ok"]
 

@@ -84,3 +84,42 @@ class TestRescanBackoff:
         relay.all_on()
         relay.all_on()
         assert hid.scans == 2   # empty scan -> backed off
+
+
+class TestUsbPresence:
+    """_usb_presence reads sysfs to say whether the board is on the bus and
+    whether the kernel bound the HID driver to it."""
+
+    def _device(self, base, name="1-2", vid="16c0", pid="05df"):
+        dev = base / name
+        dev.mkdir(parents=True)
+        (dev / "idVendor").write_text(vid + "\n")
+        (dev / "idProduct").write_text(pid + "\n")
+        return dev
+
+    def test_present_and_bound_with_hidraw(self, tmp_path):
+        dev = self._device(tmp_path)
+        iface = dev / "1-2:1.0"
+        (iface / "0003:16C0:05DF.0003" / "hidraw" / "hidraw2").mkdir(parents=True)
+        drivers = tmp_path / "drivers" / "usbhid"
+        drivers.mkdir(parents=True)
+        (iface / "driver").symlink_to(drivers)
+        msg = microrave._usb_presence(0x16c0, 0x05df, base=str(tmp_path))
+        assert "IS on the USB bus at 1-2" in msg
+        assert "driver=usbhid" in msg and "hidraw=yes" in msg
+
+    def test_present_but_hid_never_bound(self, tmp_path):
+        dev = self._device(tmp_path)
+        (dev / "1-2:1.0").mkdir()
+        msg = microrave._usb_presence(0x16c0, 0x05df, base=str(tmp_path))
+        assert "IS on the USB bus at 1-2" in msg
+        assert "driver=none" in msg and "hidraw=no" in msg
+
+    def test_absent_from_the_bus(self, tmp_path):
+        self._device(tmp_path, name="1-1", vid="2341", pid="8037")   # a different device
+        msg = microrave._usb_presence(0x16c0, 0x05df, base=str(tmp_path))
+        assert msg == "device NOT on the USB bus"
+
+    def test_no_sysfs_does_not_raise(self, tmp_path):
+        msg = microrave._usb_presence(0x16c0, 0x05df, base=str(tmp_path / "missing"))
+        assert msg == "USB sysfs unavailable"
