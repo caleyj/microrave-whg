@@ -140,6 +140,7 @@ KEYPAD_MAP = {
 RELAY_VID = 0x16c0
 RELAY_PID = 0x05df
 RELAY_SEND_TIMEOUT = 0.5   # seconds — see RelayController._send_one
+RELAY_RESCAN_INTERVAL = 5.0   # seconds between bus scans while no board is found
 
 MUSIC_ROOT        = "music"          # single shared playlist folder
 SOUNDS_DIR        = "sounds"
@@ -804,6 +805,7 @@ class RelayController:
     def __init__(self):
         self._lock = threading.Lock()
         self._paths: list = []   # known device paths — cheap to reopen per command
+        self._next_scan = 0.0    # monotonic time before which an empty scan isn't repeated
         self._discover_locked()
 
     def _discover_locked(self) -> None:
@@ -823,6 +825,9 @@ class RelayController:
                 log.warning("No USB relay board found (%04x:%04x).", RELAY_VID, RELAY_PID)
         except Exception as exc:
             log.warning("USB relay discovery failed: %s", exc)
+        # A scan that finds nothing isn't repeated on every key press — a
+        # missing board would otherwise cost a bus scan per press.
+        self._next_scan = 0.0 if self._paths else time.monotonic() + RELAY_RESCAN_INTERVAL
 
     def all_on(self) -> None:
         self._send(self._ALL_ON)
@@ -838,9 +843,10 @@ class RelayController:
     def _send(self, cmd: int) -> None:
         report = bytes([0, cmd, 0, 0, 0, 0, 0, 0, 0])
         with self._lock:
-            if not self._paths:
+            if not self._paths and time.monotonic() >= self._next_scan:
                 # No known board — look for one. Never runs when we already
-                # have a path, so a healthy board isn't re-scanned for.
+                # have a path, so a healthy board isn't re-scanned for, and
+                # backs off after an empty scan while the board is missing.
                 self._discover_locked()
             self._paths = [p for p in self._paths if self._send_one(p, report)]
 
