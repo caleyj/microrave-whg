@@ -146,9 +146,9 @@ RELAY_REASSERT_SECONDS = 20.0     # re-send ON this often while the lamp should 
 RELAY_CLOSE_WAIT = 3.0            # at shutdown, wait this long for the board to confirm OFF
 RELAY_MISSING_LOG_SECONDS = 60.0  # repeat the "no board found" warning at most this often
 # Which board channels (1-4) the lamp relay is wired to; None switches all four.
-# Channel 2 drives the 9V coil of the power relay (measured: only its release
-# resets the board's USB). The other three have nothing wired, so leave them be.
-RELAY_CHANNELS = (2,)
+# Set this once the wiring is confirmed (run `relay_helper.py test` and see
+# which channel makes the power relay engage).
+RELAY_CHANNELS = None
 # Every OFF makes this board drop off USB and re-enumerate, so go easy on it:
 RELAY_OFF_HOLD = 0.4              # hold an OFF back this long, so a quick STOP->START never sends it
 RELAY_SETTLE_AFTER_OFF = 1.5      # leave the board alone this long after an OFF while it resets
