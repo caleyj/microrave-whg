@@ -44,6 +44,7 @@ import logging
 import os
 import queue
 import random
+import shutil
 import subprocess
 import sys
 import threading
@@ -139,6 +140,17 @@ RELAY_PID = 0x05df
 RELAY_SEND_TIMEOUT = 1.5   # seconds — hard deadline for one relay_helper.py call
 RELAY_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay_helper.py")
 RELAY_RESCAN_INTERVAL = 5.0   # seconds between bus scans while no board is found
+RELAY_RETRY_BASE = 2.0            # first retry delay after a failed attempt; doubles each time
+RELAY_RETRY_MAX = 60.0            # ...up to this
+RELAY_REASSERT_SECONDS = 20.0     # re-send ON this often while the lamp should be on
+RELAY_CLOSE_WAIT = 3.0            # at shutdown, wait this long for the board to confirm OFF
+RELAY_MISSING_LOG_SECONDS = 60.0  # repeat the "no board found" warning at most this often
+# Stuck-board recovery (uhubctl port power-cycle):
+RELAY_RECOVER_MAX = 3             # attempts per outage
+RELAY_RECOVER_MIN_GAP = 30.0      # seconds between attempts
+RELAY_RECOVER_OFF_SECONDS = 3     # how long the port stays off
+RELAY_RECOVER_SETTLE = 2.0        # wait for the board to re-enumerate afterwards
+RELAY_RECOVER_TIMEOUT = 15.0      # give up on uhubctl itself after this long
 
 # Main-loop freeze tracer: if the loop goes this long without ticking, every
 # thread's stack is written to STALL_TRACE_FILE (see StallTracer).
@@ -859,15 +871,35 @@ def _usb_presence(vid: int, pid: int, base: str = "/sys/bus/usb/devices") -> str
     return "device IS on the USB bus at " + ", ".join(found)
 
 
+def _split_usb_port(name: str) -> tuple[str, str]:
+    """USB device name -> (hub location, port) as uhubctl wants them:
+    "1-2" -> ("1", "2"), "1-2.3" -> ("1-2", "3")."""
+    if "." in name:
+        loc, port = name.rsplit(".", 1)
+    else:
+        loc, port = name.split("-", 1)
+    return loc, port
+
+
 class RelayController:
     """Drives dcttech USB-HID relay board(s) (VID 16c0:05df) as a "cooking"
     indicator: all channels ON while a countdown runs, OFF otherwise.
 
+    The app only ever says what it wants (all_on / all_off) and returns at
+    once. A background worker makes the board match, so a flaky board can
+    never delay a button press, and it keeps retrying until the board does
+    match — including turning the lamp on if the board comes back mid-
+    countdown. While the lamp should be on, the worker re-sends ON every
+    RELAY_REASSERT_SECONDS, so a board that silently reset (relays default to
+    off) is put right again.
+
     All USB I/O runs in relay_helper.py, a short-lived child process with a
     hard deadline (RELAY_SEND_TIMEOUT), never in this process. A board stuck
     mid-USB-reset can block a kernel call for ~20s, and in-process that froze
-    every thread — buttons, display and audio — even when the call was made
-    from a worker thread. A child can hang alone and simply be killed.
+    every thread — buttons, display and audio. A child can hang alone and be
+    killed. If the board is seen but stuck, the worker also power-cycles just
+    its USB port with uhubctl (a data-line reset: it makes the board
+    re-enumerate in seconds instead of waiting minutes for the kernel).
 
     These cheap relay-board clones commonly only latch one command per HID
     *session* — some firmwares read the feature report when a session opens
@@ -884,14 +916,131 @@ class RelayController:
     _ALL_ON  = 0xFE
     _ALL_OFF = 0xFC
 
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._paths: list[str] = []   # known device paths
-        self._next_scan = 0.0         # monotonic time before which an empty scan isn't repeated
+    def __init__(self, start_worker: bool = True):
+        # Shared with the worker thread, guarded by _cond.
+        self._cond = threading.Condition()
+        self._desired: int | None = None    # what the app last asked for
+        self._applied: int | None = None    # what the board last confirmed
+        self._next_try = 0.0                # monotonic time of the next attempt
+        self._reassert_at: float | None = None
+        self._failures = 0
+        self._stop = False
+        # Touched only by the worker thread.
+        self._paths: list[str] = []
+        self._next_scan = 0.0
         self._stuck: subprocess.Popen | None = None   # helper that outlived its deadline
         self._disabled = False
-        with self._lock:
-            self._scan_locked()
+        self._last_port: str | None = None            # e.g. "1-2" once the board was seen
+        self._last_recover = float("-inf")
+        self._recoveries = 0
+        self._last_missing_log = float("-inf")
+        self._warned_no_uhubctl = False
+        self._thread = None
+        if start_worker:
+            self._thread = threading.Thread(target=self._worker, name="RelayWorker", daemon=True)
+            self._thread.start()
+
+    # ── Public API (never blocks on USB) ─────────────────────────────────────
+
+    def all_on(self) -> None:
+        self._set(self._ALL_ON)
+
+    def all_off(self) -> None:
+        self._set(self._ALL_OFF)
+
+    def close(self) -> None:
+        """Switch off and stop the worker, waiting briefly for the board to
+        confirm if it is reachable."""
+        self.all_off()
+        deadline = time.monotonic() + RELAY_CLOSE_WAIT
+        with self._cond:
+            while (not self._disabled and self._paths and self._applied != self._desired
+                   and time.monotonic() < deadline):
+                self._cond.wait(deadline - time.monotonic())
+            self._stop = True
+            self._cond.notify_all()
+
+    def _set(self, cmd: int) -> None:
+        with self._cond:
+            self._desired = cmd
+            self._next_try = 0.0     # a fresh request is tried straight away
+            self._failures = 0
+            self._cond.notify_all()
+
+    # ── Worker ───────────────────────────────────────────────────────────────
+
+    def _worker(self) -> None:
+        while True:
+            with self._cond:
+                while True:
+                    if self._stop:
+                        return
+                    now = time.monotonic()
+                    if self._desired is None:
+                        wait = None
+                    elif self._desired != self._applied:
+                        wait = self._next_try - now
+                    elif self._desired == self._ALL_ON and self._reassert_at is not None:
+                        wait = self._reassert_at - now
+                    else:
+                        wait = None
+                    if wait is not None and wait <= 0:
+                        break
+                    if wait is None:
+                        self._cond.notify_all()
+                    self._cond.wait(wait)
+                cmd = self._desired
+            try:
+                ok = self._apply(cmd)
+            except Exception:
+                log.exception("USB relay worker error")
+                ok = False
+            with self._cond:
+                now = time.monotonic()
+                if ok:
+                    self._applied = cmd
+                    self._failures = 0
+                    self._next_try = 0.0
+                    self._reassert_at = (now + RELAY_REASSERT_SECONDS
+                                         if cmd == self._ALL_ON else None)
+                    self._recoveries = 0
+                else:
+                    self._applied = None
+                    self._failures += 1
+                    self._next_try = now + min(RELAY_RETRY_MAX,
+                                               RELAY_RETRY_BASE * 2 ** (self._failures - 1))
+                self._cond.notify_all()
+
+    def _apply(self, cmd: int) -> bool:
+        """Make the board match `cmd`. True if it confirmed (or there is
+        nothing to do); False means try again later."""
+        if self._disabled:
+            return True
+        if not self._paths and time.monotonic() >= self._next_scan:
+            self._scan()
+            if self._disabled:
+                return True
+        if not self._paths:
+            self._recover_port()
+            return False
+        res = self._run_helper("send", cmd, *self._paths)
+        if res is None:
+            log.warning("USB relay send did not complete — dropping %r", self._paths)
+            self._paths = []
+            self._recover_port()
+            return False
+        good = []
+        for r in res.get("results", []):
+            if r.get("ok"):
+                good.append(r["path"])
+            else:
+                log.warning("USB relay send failed (%r): %s — %s", r.get("path"),
+                            r.get("error"), _usb_presence(RELAY_VID, RELAY_PID))
+        self._paths = good
+        if not good:
+            self._recover_port()
+            return False
+        return True
 
     def _run_helper(self, *args) -> dict | None:
         """Run relay_helper.py with a hard deadline. Returns its JSON reply,
@@ -927,8 +1076,8 @@ class RelayController:
                         proc.returncode, (err or out).strip()[-200:])
             return None
 
-    def _scan_locked(self) -> None:
-        """Scan the USB bus for matching boards. Caller must hold self._lock."""
+    def _scan(self) -> None:
+        """Scan the USB bus for matching boards."""
         res = self._run_helper("scan")
         self._paths = []
         if res is not None:
@@ -942,45 +1091,51 @@ class RelayController:
             self._paths = [b["path"] for b in boards]
             for b in boards:
                 log.info("USB relay found: %s serial=%s", b.get("product"), b.get("serial"))
-            if not self._paths:
-                log.warning("No USB relay board found (%04x:%04x) — %s",
-                            RELAY_VID, RELAY_PID, _usb_presence(RELAY_VID, RELAY_PID))
-        # A scan that finds nothing isn't repeated on every key press — a
-        # missing board would otherwise cost a helper launch per press.
+            if self._paths:
+                self._last_port = self._paths[0].split(":")[0]
+                self._last_missing_log = float("-inf")
+            else:
+                now = time.monotonic()
+                if now - self._last_missing_log >= RELAY_MISSING_LOG_SECONDS:
+                    self._last_missing_log = now
+                    log.warning("No USB relay board found (%04x:%04x) — %s",
+                                RELAY_VID, RELAY_PID, _usb_presence(RELAY_VID, RELAY_PID))
+        # A scan that finds nothing isn't repeated straight away — a missing
+        # board would otherwise cost a helper launch on every retry.
         self._next_scan = 0.0 if self._paths else time.monotonic() + RELAY_RESCAN_INTERVAL
 
-    def all_on(self) -> None:
-        self._send(self._ALL_ON)
-
-    def all_off(self) -> None:
-        self._send(self._ALL_OFF)
-
-    def close(self) -> None:
-        """Nothing is held open between commands — just make sure the
-        board(s) end up off."""
-        self.all_off()
-
-    def _send(self, cmd: int) -> None:
-        with self._lock:
-            if self._disabled:
-                return
-            if not self._paths and time.monotonic() >= self._next_scan:
-                self._scan_locked()
-            if self._disabled or not self._paths:
-                return
-            res = self._run_helper("send", cmd, *self._paths)
-            if res is None:
-                log.warning("USB relay send did not complete — dropping %r", self._paths)
-                self._paths = []
-                return
-            good = []
-            for r in res.get("results", []):
-                if r.get("ok"):
-                    good.append(r["path"])
-                else:
-                    log.warning("USB relay send failed (%r): %s — %s", r.get("path"),
-                                r.get("error"), _usb_presence(RELAY_VID, RELAY_PID))
-            self._paths = good
+    def _recover_port(self) -> None:
+        """Power-cycle the relay's USB port so a stuck board re-enumerates.
+        Only after the board has been seen this run, at most RELAY_RECOVER_MAX
+        times per outage and RELAY_RECOVER_MIN_GAP apart."""
+        if not self._last_port or self._recoveries >= RELAY_RECOVER_MAX:
+            return
+        now = time.monotonic()
+        if now - self._last_recover < RELAY_RECOVER_MIN_GAP:
+            return
+        exe = shutil.which("uhubctl")
+        if not exe:
+            if not self._warned_no_uhubctl:
+                self._warned_no_uhubctl = True
+                log.warning("uhubctl not installed — cannot reset a stuck USB relay port.")
+            return
+        try:
+            loc, port = _split_usb_port(self._last_port)
+        except ValueError:
+            return
+        self._last_recover = now
+        self._recoveries += 1
+        log.warning("USB relay stuck — resetting USB port %s (attempt %d of %d).",
+                    self._last_port, self._recoveries, RELAY_RECOVER_MAX)
+        try:
+            subprocess.run([exe, "-l", loc, "-p", port, "-a", "cycle",
+                            "-d", str(RELAY_RECOVER_OFF_SECONDS)],
+                           capture_output=True, timeout=RELAY_RECOVER_TIMEOUT)
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.warning("USB port reset failed: %s", exc)
+        self._paths = []
+        self._next_scan = 0.0
+        time.sleep(RELAY_RECOVER_SETTLE)   # let the board re-enumerate
 
 
 # =============================================================================

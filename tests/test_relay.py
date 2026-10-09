@@ -1,4 +1,5 @@
-"""RelayController (subprocess-based), the stall tracer, and USB presence."""
+"""RelayController (background worker + helper process), the stall tracer,
+and USB presence."""
 import os
 import time
 
@@ -7,21 +8,54 @@ import pytest
 import microrave
 
 FAKE_HID_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_hid")
+ON, OFF = microrave.RelayController._ALL_ON, microrave.RelayController._ALL_OFF
 
 
-# ── Backoff / bookkeeping, with the helper process stubbed out ────────────────
+def wait_for(cond, timeout=3.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return cond()
+
 
 @pytest.fixture
-def scripted(monkeypatch):
+def fast(monkeypatch):
+    """Short timers so the worker's retry/reassert behaviour can be observed."""
+    for name, value in dict(RELAY_RESCAN_INTERVAL=0.2, RELAY_RETRY_BASE=0.05,
+                            RELAY_RETRY_MAX=0.2, RELAY_REASSERT_SECONDS=0.15,
+                            RELAY_RECOVER_SETTLE=0.0, RELAY_RECOVER_MIN_GAP=5.0,
+                            RELAY_CLOSE_WAIT=0.3).items():
+        monkeypatch.setattr(microrave, name, value)
+
+
+@pytest.fixture
+def make_relay(request):
+    def make(**kw):
+        relay = microrave.RelayController(**kw)
+        request.addfinalizer(relay.close if kw.get("start_worker", True) else (lambda: None))
+        return relay
+    return make
+
+
+@pytest.fixture
+def scripted(monkeypatch, fast):
+    """Stub out the helper process; the script says what the board does."""
     class Script:
         def __init__(self):
             self.calls = []
             self.boards = []
             self.send_ok = True
-            self.send_hangs = False
+            self.send_hangs = False   # _run_helper returns None, as after a timeout
+            self.fail_sends = 0       # fail this many sends, then behave
+            self.delay = 0.0
 
         def scans(self):
             return sum(1 for c in self.calls if c[0] == "scan")
+
+        def sends(self):
+            return [c[1] for c in self.calls if c[0] == "send"]
 
     sc = Script()
 
@@ -30,79 +64,187 @@ def scripted(monkeypatch):
         if args[0] == "scan":
             return {"boards": [{"path": p, "product": "USBRelay4", "serial": ""}
                                for p in sc.boards]}
+        time.sleep(sc.delay)
         if sc.send_hangs:
-            return None   # what _run_helper returns after a timeout
+            return None
+        if sc.fail_sends > 0:
+            sc.fail_sends -= 1
+            return None
         return {"results": [{"path": p, "ok": sc.send_ok} for p in args[2:]]}
 
     monkeypatch.setattr(microrave.RelayController, "_run_helper", fake_run)
-    monkeypatch.setattr(microrave, "RELAY_RESCAN_INTERVAL", 0.2)
     return sc
 
 
-class TestRescanBackoff:
+# ── _apply: scan/backoff bookkeeping, run synchronously ───────────────────────
 
-    def test_missing_board_is_not_rescanned_on_every_command(self, scripted):
-        relay = microrave.RelayController()
+class TestApplyLogic:
+
+    def test_missing_board_is_not_rescanned_within_the_interval(self, scripted, make_relay):
+        relay = make_relay(start_worker=False)
         for _ in range(5):
-            relay.all_on()
-        assert scripted.scans() == 1   # just the startup scan
-
-    def test_missing_board_is_rescanned_after_the_interval(self, scripted):
-        relay = microrave.RelayController()
+            assert relay._apply(ON) is False
+        assert scripted.scans() == 1
         time.sleep(0.25)
-        relay.all_on()
+        relay._apply(ON)
         assert scripted.scans() == 2
 
-    def test_board_that_appears_later_is_picked_up_and_used(self, scripted):
-        relay = microrave.RelayController()
+    def test_found_board_is_never_rescanned(self, scripted, make_relay):
         scripted.boards = ["1-2:1.0"]
-        time.sleep(0.25)
+        relay = make_relay(start_worker=False)
+        for _ in range(6):
+            assert relay._apply(ON) is True
+            assert relay._apply(OFF) is True
+        assert scripted.scans() == 1
+
+    def test_lost_board_is_rescanned_immediately_then_backs_off(self, scripted, make_relay):
+        scripted.boards = ["1-2:1.0"]
+        relay = make_relay(start_worker=False)
+        assert relay._apply(ON) is True
+        scripted.boards = []
+        scripted.send_ok = False
+        assert relay._apply(ON) is False    # send fails, path dropped
+        assert relay._apply(ON) is False    # next attempt rescans at once...
+        assert scripted.scans() == 2
+        relay._apply(ON)
+        relay._apply(ON)
+        assert scripted.scans() == 2        # ...and an empty scan backs off
+
+    def test_hung_send_drops_the_path_and_rescans_next_time(self, scripted, make_relay):
+        scripted.boards = ["1-2:1.0"]
+        relay = make_relay(start_worker=False)
+        scripted.send_hangs = True
+        assert relay._apply(ON) is False
+        assert relay._paths == []
+        scripted.send_hangs = False
+        assert relay._apply(ON) is True
+        assert scripted.scans() == 2
+
+
+# ── The worker: app calls never wait, state converges ─────────────────────────
+
+class TestWorker:
+
+    def test_calls_return_immediately_even_when_the_board_is_slow(self, scripted, make_relay):
+        scripted.boards = ["1-2:1.0"]
+        scripted.delay = 0.5
+        relay = make_relay()
+        t0 = time.monotonic()
         relay.all_on()
         relay.all_off()
         relay.all_on()
-        assert scripted.scans() == 2   # found, so no further scans
-        sends = [c for c in scripted.calls if c[0] == "send"]
-        assert len(sends) == 3
-        assert sends[0][2] == "1-2:1.0"
+        assert time.monotonic() - t0 < 0.1
 
-    def test_found_board_is_never_rescanned(self, scripted):
+    def test_latest_request_wins(self, scripted, make_relay):
         scripted.boards = ["1-2:1.0"]
-        relay = microrave.RelayController()
-        for _ in range(6):
-            relay.all_on()
-            relay.all_off()
-        assert scripted.scans() == 1
+        scripted.delay = 0.1
+        relay = make_relay()
+        for fn in (relay.all_on, relay.all_off, relay.all_on, relay.all_off):
+            fn()
+        assert wait_for(lambda: relay._applied == OFF)
+        assert scripted.sends()[-1] == OFF
 
-    def test_lost_board_is_rescanned_immediately_then_backs_off(self, scripted):
+    def test_retries_until_the_board_answers(self, scripted, make_relay):
         scripted.boards = ["1-2:1.0"]
-        relay = microrave.RelayController()
-        scripted.boards = []
-        scripted.send_ok = False
-        relay.all_on()          # send fails, path dropped
-        relay.all_on()          # first command after the loss rescans at once
-        assert scripted.scans() == 2
+        scripted.fail_sends = 2
+        relay = make_relay()
         relay.all_on()
-        relay.all_on()
-        assert scripted.scans() == 2   # empty scan -> backed off
+        assert wait_for(lambda: relay._applied == ON)
+        assert len(scripted.sends()) >= 3
 
-    def test_hung_send_drops_the_path_and_rescans_next_time(self, scripted):
+    def test_lamp_turns_on_when_the_board_returns_mid_countdown(self, scripted, make_relay):
+        relay = make_relay()
+        relay.all_on()
+        time.sleep(0.3)
+        assert relay._applied is None       # board still missing
         scripted.boards = ["1-2:1.0"]
-        relay = microrave.RelayController()
+        assert wait_for(lambda: relay._applied == ON)
+
+    def test_on_is_reasserted_while_counting_down(self, scripted, make_relay):
+        scripted.boards = ["1-2:1.0"]
+        relay = make_relay()
+        relay.all_on()
+        assert wait_for(lambda: scripted.sends().count(ON) >= 3)
+
+    def test_off_is_not_resent_when_nothing_changed(self, scripted, make_relay):
+        scripted.boards = ["1-2:1.0"]
+        relay = make_relay()
+        relay.all_off()
+        assert wait_for(lambda: relay._applied == OFF)
+        n = len(scripted.sends())
+        relay.all_off()
+        time.sleep(0.3)
+        assert len(scripted.sends()) == n
+
+    def test_close_switches_off_and_stops_the_worker(self, scripted, make_relay):
+        scripted.boards = ["1-2:1.0"]
+        relay = make_relay()
+        relay.all_on()
+        assert wait_for(lambda: relay._applied == ON)
+        relay.close()
+        assert scripted.sends()[-1] == OFF
+        assert wait_for(lambda: not relay._thread.is_alive())
+
+    def test_close_does_not_hang_when_there_is_no_board(self, scripted, make_relay):
+        relay = make_relay()
+        relay.all_off()
+        time.sleep(0.1)
+        t0 = time.monotonic()
+        relay.close()
+        assert time.monotonic() - t0 < 0.2
+
+
+# ── Stuck-board recovery (uhubctl port reset) ─────────────────────────────────
+
+class TestPortRecovery:
+
+    @pytest.fixture
+    def uhubctl(self, monkeypatch):
+        runs = []
+        monkeypatch.setattr(microrave.shutil, "which", lambda name: "/usr/bin/" + name)
+        monkeypatch.setattr(microrave.subprocess, "run",
+                            lambda cmd, **kw: runs.append(cmd))
+        return runs
+
+    def test_split_usb_port(self):
+        assert microrave._split_usb_port("1-2") == ("1", "2")
+        assert microrave._split_usb_port("1-2.3") == ("1-2", "3")
+
+    def test_stuck_board_gets_its_port_reset_once(self, scripted, uhubctl, make_relay):
+        scripted.boards = ["1-2:1.0"]
+        relay = make_relay()
+        relay.all_off()
+        assert wait_for(lambda: relay._applied == OFF)
         scripted.send_hangs = True
         relay.all_on()
-        assert relay._paths == []
-        scripted.send_hangs = False
+        assert wait_for(lambda: len(uhubctl) >= 1)
+        assert uhubctl[0][:7] == ["/usr/bin/uhubctl", "-l", "1", "-p", "2", "-a", "cycle"]
+        time.sleep(0.4)                     # many retries, but rate-limited
+        assert len(uhubctl) == 1
+
+    def test_no_reset_for_a_board_that_was_never_seen(self, scripted, uhubctl, make_relay):
+        relay = make_relay()
         relay.all_on()
-        assert scripted.scans() == 2
+        time.sleep(0.4)
+        assert uhubctl == []
+
+    def test_missing_uhubctl_is_harmless(self, scripted, monkeypatch, make_relay):
+        monkeypatch.setattr(microrave.shutil, "which", lambda name: None)
+        scripted.boards = ["1-2:1.0"]
+        relay = make_relay()
+        relay.all_off()
+        assert wait_for(lambda: relay._applied == OFF)
+        scripted.send_hangs = True
+        relay.all_on()
+        assert wait_for(lambda: relay._failures >= 1)
 
 
 # ── The real relay_helper.py, against a fake hid module ───────────────────────
 
 @pytest.fixture
-def fake_hid(monkeypatch, tmp_path):
+def fake_hid(monkeypatch, tmp_path, fast):
     monkeypatch.setenv("PYTHONPATH", FAKE_HID_DIR)
     monkeypatch.setenv("FAKE_HID_LOG", str(tmp_path / "reports.txt"))
-    monkeypatch.setattr(microrave, "RELAY_RESCAN_INTERVAL", 0.2)
 
     def mode(name):
         monkeypatch.setenv("FAKE_HID_MODE", name)
@@ -113,47 +255,53 @@ def fake_hid(monkeypatch, tmp_path):
 
 class TestRelayHelperProcess:
 
-    def test_commands_reach_the_board(self, fake_hid):
-        relay = microrave.RelayController()
-        assert relay._paths == ["1-2:1.0"]
+    def test_commands_reach_the_board(self, fake_hid, make_relay):
+        relay = make_relay()
         relay.all_on()
+        assert wait_for(lambda: relay._applied == ON, timeout=5)
         relay.all_off()
+        assert wait_for(lambda: relay._applied == OFF, timeout=5)
         reports = fake_hid.log.read_text().split()
-        assert reports == ["00fe" + "00" * 7, "00fc" + "00" * 7]
+        assert reports[0] == "00fe" + "00" * 7
+        assert reports[-1] == "00fc" + "00" * 7
 
-    def test_no_board_present(self, fake_hid):
+    def test_no_board_present(self, fake_hid, make_relay):
         fake_hid("absent")
-        relay = microrave.RelayController()
-        assert relay._paths == []
-        assert not relay._disabled
+        relay = make_relay()
+        relay.all_on()
+        assert wait_for(lambda: relay._failures >= 1, timeout=5)
+        assert relay._paths == [] and not relay._disabled
 
-    def test_failed_open_drops_the_path(self, fake_hid):
-        relay = microrave.RelayController()
+    def test_failed_open_leaves_the_state_unconfirmed(self, fake_hid, make_relay):
+        relay = make_relay()
+        relay.all_off()
+        assert wait_for(lambda: relay._applied == OFF, timeout=5)
         fake_hid("open_fail")
         relay.all_on()
-        assert relay._paths == []
+        assert wait_for(lambda: relay._failures >= 1, timeout=5)
+        assert relay._applied is None
 
-    def test_missing_hidapi_disables_the_controller(self, fake_hid):
+    def test_missing_hidapi_disables_the_controller(self, fake_hid, make_relay):
         fake_hid("missing")
-        relay = microrave.RelayController()
-        assert relay._disabled
-        relay.all_on()   # a safe no-op
+        relay = make_relay()
+        relay.all_on()
+        assert wait_for(lambda: relay._disabled, timeout=5)
 
-    def test_a_hung_board_cannot_block_past_the_deadline(self, fake_hid, monkeypatch):
+    def test_a_hung_board_never_delays_the_caller(self, fake_hid, monkeypatch, make_relay):
         monkeypatch.setattr(microrave, "RELAY_SEND_TIMEOUT", 0.8)
-        relay = microrave.RelayController()
+        relay = make_relay()
+        relay.all_off()
+        assert wait_for(lambda: relay._applied == OFF, timeout=5)
         fake_hid("hang_open")
 
-        for _ in range(2):   # every call is bounded, not just the first
-            t0 = time.monotonic()
-            relay.all_on()
-            assert time.monotonic() - t0 < 2.5
-            assert relay._paths == []
-            assert relay._stuck is not None
-            relay._stuck.wait(timeout=5)   # the hung helper was killed and reaps
+        t0 = time.monotonic()
+        relay.all_on()
+        assert time.monotonic() - t0 < 0.1          # the app is never held up
+        assert wait_for(lambda: relay._stuck is not None, timeout=5)
+        relay._stuck.wait(timeout=5)                # the hung helper was killed and reaps
 
-    def test_unkillable_helper_makes_later_calls_fail_fast(self, fake_hid, monkeypatch):
-        relay = microrave.RelayController()
+    def test_unkillable_helper_makes_later_calls_fail_fast(self, monkeypatch, make_relay):
+        relay = make_relay(start_worker=False)
 
         class StuckProc:
             def poll(self):
@@ -165,7 +313,7 @@ class TestRelayHelperProcess:
         relay._stuck = StuckProc()
         monkeypatch.setattr(microrave.subprocess, "Popen", no_new_helpers)
         t0 = time.monotonic()
-        relay.all_on()
+        assert relay._run_helper("scan") is None
         assert time.monotonic() - t0 < 0.2
 
 
