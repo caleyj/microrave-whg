@@ -26,7 +26,8 @@ def fast(monkeypatch):
     for name, value in dict(RELAY_RESCAN_INTERVAL=0.2, RELAY_RETRY_BASE=0.05,
                             RELAY_RETRY_MAX=0.2, RELAY_REASSERT_SECONDS=0.15,
                             RELAY_RECOVER_SETTLE=0.0, RELAY_RECOVER_MIN_GAP=5.0,
-                            RELAY_CLOSE_WAIT=0.3).items():
+                            RELAY_CLOSE_WAIT=0.3, RELAY_OFF_HOLD=0.02,
+                            RELAY_SETTLE_AFTER_OFF=0.02, RELAY_CHANNELS=None).items():
         monkeypatch.setattr(microrave, name, value)
 
 
@@ -50,6 +51,7 @@ def scripted(monkeypatch, fast):
             self.send_hangs = False   # _run_helper returns None, as after a timeout
             self.fail_sends = 0       # fail this many sends, then behave
             self.delay = 0.0
+            self.times = []           # (command, monotonic time) of each send
 
         def scans(self):
             return sum(1 for c in self.calls if c[0] == "scan")
@@ -64,13 +66,15 @@ def scripted(monkeypatch, fast):
         if args[0] == "scan":
             return {"boards": [{"path": p, "product": "USBRelay4", "serial": ""}
                                for p in sc.boards]}
+        sc.times.append((args[1], time.monotonic()))
         time.sleep(sc.delay)
         if sc.send_hangs:
             return None
         if sc.fail_sends > 0:
             sc.fail_sends -= 1
             return None
-        return {"results": [{"path": p, "ok": sc.send_ok} for p in args[2:]]}
+        paths = args[3:] if args[0] == "sendch" else args[2:]
+        return {"results": [{"path": p, "ok": sc.send_ok} for p in paths]}
 
     monkeypatch.setattr(microrave.RelayController, "_run_helper", fake_run)
     return sc
@@ -194,6 +198,65 @@ class TestWorker:
         assert time.monotonic() - t0 < 0.2
 
 
+# ── Channel selection, OFF hold-back and the post-OFF quiet period ────────────
+
+class TestGentleSwitching:
+
+    def test_all_channels_by_default(self, scripted, make_relay):
+        scripted.boards = ["1-2:1.0"]
+        relay = make_relay(start_worker=False)
+        relay._apply(ON)
+        assert scripted.calls[-1] == ("send", ON, "1-2:1.0")
+
+    def test_only_the_configured_channels_are_switched(self, scripted, make_relay, monkeypatch):
+        monkeypatch.setattr(microrave, "RELAY_CHANNELS", (1,))
+        scripted.boards = ["1-2:1.0"]
+        relay = make_relay(start_worker=False)
+        relay._apply(ON)
+        assert scripted.calls[-1] == ("sendch", 0xFF, "1", "1-2:1.0")
+        relay._apply(OFF)
+        assert scripted.calls[-1] == ("sendch", 0xFD, "1", "1-2:1.0")
+        monkeypatch.setattr(microrave, "RELAY_CHANNELS", (1, 3))
+        relay._apply(ON)
+        assert scripted.calls[-1] == ("sendch", 0xFF, "1,3", "1-2:1.0")
+
+    def test_a_quick_stop_then_start_never_sends_the_off(self, scripted, make_relay, monkeypatch):
+        monkeypatch.setattr(microrave, "RELAY_OFF_HOLD", 0.3)
+        scripted.boards = ["1-2:1.0"]
+        relay = make_relay()
+        relay.all_on()
+        assert wait_for(lambda: relay._applied == ON)
+        before = len(scripted.sends())
+        relay.all_off()
+        time.sleep(0.05)
+        relay.all_on()
+        time.sleep(0.5)
+        assert OFF not in scripted.sends()[before:]
+        assert relay._applied == ON
+
+    def test_an_off_is_still_sent_when_nothing_cancels_it(self, scripted, make_relay, monkeypatch):
+        monkeypatch.setattr(microrave, "RELAY_OFF_HOLD", 0.2)
+        scripted.boards = ["1-2:1.0"]
+        relay = make_relay()
+        relay.all_on()
+        assert wait_for(lambda: relay._applied == ON)
+        relay.all_off()
+        assert wait_for(lambda: relay._applied == OFF)
+
+    def test_the_board_is_left_alone_after_an_off(self, scripted, make_relay, monkeypatch):
+        monkeypatch.setattr(microrave, "RELAY_SETTLE_AFTER_OFF", 0.4)
+        monkeypatch.setattr(microrave, "RELAY_REASSERT_SECONDS", 60.0)
+        scripted.boards = ["1-2:1.0"]
+        relay = make_relay()
+        relay.all_off()
+        assert wait_for(lambda: relay._applied == OFF)
+        relay.all_on()
+        assert wait_for(lambda: relay._applied == ON)
+        off_t = next(t for cmd, t in scripted.times if cmd == OFF)
+        on_t = next(t for cmd, t in scripted.times if cmd == ON)
+        assert on_t - off_t >= 0.35
+
+
 # ── Stuck-board recovery (uhubctl port reset) ─────────────────────────────────
 
 class TestPortRecovery:
@@ -264,6 +327,28 @@ class TestRelayHelperProcess:
         reports = fake_hid.log.read_text().split()
         assert reports[0] == "00fe" + "00" * 7
         assert reports[-1] == "00fc" + "00" * 7
+
+    def test_configured_channels_reach_the_board(self, fake_hid, monkeypatch, make_relay):
+        monkeypatch.setattr(microrave, "RELAY_CHANNELS", (2,))
+        relay = make_relay()
+        relay.all_on()
+        assert wait_for(lambda: relay._applied == ON, timeout=5)
+        relay.all_off()
+        assert wait_for(lambda: relay._applied == OFF, timeout=5)
+        reports = fake_hid.log.read_text().split()
+        assert reports[0] == "00ff02" + "00" * 6
+        assert reports[-1] == "00fd02" + "00" * 6
+
+    def test_channel_test_command_clicks_each_channel(self, fake_hid):
+        import subprocess, sys
+        out = subprocess.run([sys.executable, microrave.RELAY_HELPER, "test", "1-2:1.0", "0.01"],
+                             capture_output=True, text=True, timeout=10).stdout
+        assert out.strip().endswith("done")
+        for ch in (1, 2, 3, 4):
+            assert "channel %d ON" % ch in out and "channel %d OFF" % ch in out
+        reports = fake_hid.log.read_text().split()
+        assert reports == [("00ff0%d" % ch) + "00" * 6 if on else ("00fd0%d" % ch) + "00" * 6
+                           for ch in (1, 2, 3, 4) for on in (True, False)]
 
     def test_no_board_present(self, fake_hid, make_relay):
         fake_hid("absent")

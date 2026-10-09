@@ -145,6 +145,11 @@ RELAY_RETRY_MAX = 60.0            # ...up to this
 RELAY_REASSERT_SECONDS = 20.0     # re-send ON this often while the lamp should be on
 RELAY_CLOSE_WAIT = 3.0            # at shutdown, wait this long for the board to confirm OFF
 RELAY_MISSING_LOG_SECONDS = 60.0  # repeat the "no board found" warning at most this often
+# Which board channels (1-4) the lamp relay is wired to; None switches all four.
+RELAY_CHANNELS = None
+# Every OFF makes this board drop off USB and re-enumerate, so go easy on it:
+RELAY_OFF_HOLD = 0.4              # hold an OFF back this long, so a quick STOP->START never sends it
+RELAY_SETTLE_AFTER_OFF = 1.5      # leave the board alone this long after an OFF while it resets
 # Stuck-board recovery (uhubctl port power-cycle):
 RELAY_RECOVER_MAX = 3             # attempts per outage
 RELAY_RECOVER_MIN_GAP = 30.0      # seconds between attempts
@@ -915,6 +920,8 @@ class RelayController:
 
     _ALL_ON  = 0xFE
     _ALL_OFF = 0xFC
+    _ONE_ON  = 0xFF
+    _ONE_OFF = 0xFD
 
     def __init__(self, start_worker: bool = True):
         # Shared with the worker thread, guarded by _cond.
@@ -924,6 +931,7 @@ class RelayController:
         self._next_try = 0.0                # monotonic time of the next attempt
         self._reassert_at: float | None = None
         self._failures = 0
+        self._quiet_until = 0.0             # no board contact before this time
         self._stop = False
         # Touched only by the worker thread.
         self._paths: list[str] = []
@@ -946,12 +954,12 @@ class RelayController:
         self._set(self._ALL_ON)
 
     def all_off(self) -> None:
-        self._set(self._ALL_OFF)
+        self._set(self._ALL_OFF, hold=RELAY_OFF_HOLD)
 
     def close(self) -> None:
         """Switch off and stop the worker, waiting briefly for the board to
         confirm if it is reachable."""
-        self.all_off()
+        self._set(self._ALL_OFF)
         deadline = time.monotonic() + RELAY_CLOSE_WAIT
         with self._cond:
             while (not self._disabled and self._paths and self._applied != self._desired
@@ -960,10 +968,12 @@ class RelayController:
             self._stop = True
             self._cond.notify_all()
 
-    def _set(self, cmd: int) -> None:
+    def _set(self, cmd: int, hold: float = 0.0) -> None:
         with self._cond:
             self._desired = cmd
-            self._next_try = 0.0     # a fresh request is tried straight away
+            # A fresh request is tried straight away, except an OFF is held
+            # back briefly: an ON that follows cancels it before it is sent.
+            self._next_try = time.monotonic() + hold
             self._failures = 0
             self._cond.notify_all()
 
@@ -984,6 +994,8 @@ class RelayController:
                         wait = self._reassert_at - now
                     else:
                         wait = None
+                    if wait is not None and wait <= 0 and now < self._quiet_until:
+                        wait = self._quiet_until - now
                     if wait is not None and wait <= 0:
                         break
                     if wait is None:
@@ -1004,6 +1016,8 @@ class RelayController:
                     self._reassert_at = (now + RELAY_REASSERT_SECONDS
                                          if cmd == self._ALL_ON else None)
                     self._recoveries = 0
+                    if cmd == self._ALL_OFF:
+                        self._quiet_until = now + RELAY_SETTLE_AFTER_OFF
                 else:
                     self._applied = None
                     self._failures += 1
@@ -1023,7 +1037,11 @@ class RelayController:
         if not self._paths:
             self._recover_port()
             return False
-        res = self._run_helper("send", cmd, *self._paths)
+        if RELAY_CHANNELS:
+            one = self._ONE_ON if cmd == self._ALL_ON else self._ONE_OFF
+            res = self._run_helper("sendch", one, ",".join(map(str, RELAY_CHANNELS)), *self._paths)
+        else:
+            res = self._run_helper("send", cmd, *self._paths)
         if res is None:
             log.warning("USB relay send did not complete — dropping %r", self._paths)
             self._paths = []
