@@ -154,7 +154,8 @@ RELAY_CHANNELS = (2,)
 RELAY_OFF_HOLD = 0.4              # hold an OFF back this long, so a quick STOP->START never sends it
 RELAY_SETTLE_AFTER_OFF = 1.5      # leave the board alone this long after an OFF while it resets
 # Stuck-board recovery (uhubctl port power-cycle):
-RELAY_RECOVER_MAX = 3             # attempts per outage
+RELAY_RECOVER_AFTER = 90.0        # let the kernel try first: reset the port only after this long stuck
+RELAY_RECOVER_MAX = 1             # attempts per outage
 RELAY_RECOVER_MIN_GAP = 30.0      # seconds between attempts
 RELAY_RECOVER_OFF_SECONDS = 3     # how long the port stays off
 RELAY_RECOVER_SETTLE = 2.0        # wait for the board to re-enumerate afterwards
@@ -905,9 +906,11 @@ class RelayController:
     hard deadline (RELAY_SEND_TIMEOUT), never in this process. A board stuck
     mid-USB-reset can block a kernel call for ~20s, and in-process that froze
     every thread — buttons, display and audio. A child can hang alone and be
-    killed. If the board is seen but stuck, the worker also power-cycles just
-    its USB port with uhubctl (a data-line reset: it makes the board
-    re-enumerate in seconds instead of waiting minutes for the kernel).
+    killed. If a board that was seen stays stuck for RELAY_RECOVER_AFTER
+    seconds, the worker resets just its USB port with uhubctl, once. (It waits
+    because the kernel usually recovers a wedged board on its own, and a
+    data-line reset cannot revive one whose chip has hung — only unplugging
+    it does.)
 
     These cheap relay-board clones commonly only latch one command per HID
     *session* — some firmwares read the feature report when a session opens
@@ -944,6 +947,7 @@ class RelayController:
         self._last_port: str | None = None            # e.g. "1-2" once the board was seen
         self._last_recover = float("-inf")
         self._recoveries = 0
+        self._outage_since: float | None = None   # when the current run of failures began
         self._last_missing_log = float("-inf")
         self._warned_no_uhubctl = False
         self._thread = None
@@ -1019,10 +1023,13 @@ class RelayController:
                     self._reassert_at = (now + RELAY_REASSERT_SECONDS
                                          if cmd == self._ALL_ON else None)
                     self._recoveries = 0
+                    self._outage_since = None
                     if cmd == self._ALL_OFF:
                         self._quiet_until = now + RELAY_SETTLE_AFTER_OFF
                 else:
                     self._applied = None
+                    if self._outage_since is None:
+                        self._outage_since = now
                     self._failures += 1
                     self._next_try = now + min(RELAY_RETRY_MAX,
                                                RELAY_RETRY_BASE * 2 ** (self._failures - 1))
@@ -1132,6 +1139,8 @@ class RelayController:
         if not self._last_port or self._recoveries >= RELAY_RECOVER_MAX:
             return
         now = time.monotonic()
+        if self._outage_since is None or now - self._outage_since < RELAY_RECOVER_AFTER:
+            return   # give the kernel's own reset a chance first
         if now - self._last_recover < RELAY_RECOVER_MIN_GAP:
             return
         exe = shutil.which("uhubctl")

@@ -25,7 +25,7 @@ def fast(monkeypatch):
     """Short timers so the worker's retry/reassert behaviour can be observed."""
     for name, value in dict(RELAY_RESCAN_INTERVAL=0.2, RELAY_RETRY_BASE=0.05,
                             RELAY_RETRY_MAX=0.2, RELAY_REASSERT_SECONDS=0.15,
-                            RELAY_RECOVER_SETTLE=0.0, RELAY_RECOVER_MIN_GAP=5.0,
+                            RELAY_RECOVER_SETTLE=0.0, RELAY_RECOVER_MIN_GAP=5.0, RELAY_RECOVER_AFTER=0.05,
                             RELAY_CLOSE_WAIT=0.3, RELAY_OFF_HOLD=0.02,
                             RELAY_SETTLE_AFTER_OFF=0.02, RELAY_CHANNELS=None).items():
         monkeypatch.setattr(microrave, name, value)
@@ -284,6 +284,34 @@ class TestPortRecovery:
         assert uhubctl[0][:7] == ["/usr/bin/uhubctl", "-l", "1", "-p", "2", "-a", "cycle"]
         time.sleep(0.4)                     # many retries, but rate-limited
         assert len(uhubctl) == 1
+
+    def test_the_kernel_gets_a_grace_period_before_any_reset(self, scripted, uhubctl,
+                                                            make_relay, monkeypatch):
+        monkeypatch.setattr(microrave, "RELAY_RECOVER_AFTER", 0.8)
+        scripted.boards = ["1-2:1.0"]
+        relay = make_relay()
+        relay.all_off()
+        assert wait_for(lambda: relay._applied == OFF)
+        scripted.send_hangs = True
+        relay.all_on()
+        time.sleep(0.5)
+        assert uhubctl == []                    # still inside the grace period
+        assert wait_for(lambda: len(uhubctl) == 1, timeout=3)
+
+    def test_a_recovered_board_resets_the_outage_clock(self, scripted, uhubctl,
+                                                      make_relay, monkeypatch):
+        monkeypatch.setattr(microrave, "RELAY_RECOVER_AFTER", 0.8)
+        scripted.boards = ["1-2:1.0"]
+        relay = make_relay()
+        relay.all_off()
+        assert wait_for(lambda: relay._applied == OFF)
+        scripted.send_hangs = True
+        relay.all_on()
+        time.sleep(0.3)
+        scripted.send_hangs = False             # the kernel recovered it
+        assert wait_for(lambda: relay._applied == ON)
+        assert relay._outage_since is None
+        assert uhubctl == []
 
     def test_no_reset_for_a_board_that_was_never_seen(self, scripted, uhubctl, make_relay):
         relay = make_relay()
